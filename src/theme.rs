@@ -33,7 +33,7 @@ const BRICK: Color = Color::hex(0xD4524A);
 pub const SURFACE: Color = BLACK;
 pub const TEXT_PRIMARY: Color = IVORY;
 pub const TEXT_SECONDARY: Color = CLOUD;
-pub const TEXT_TERTIARY: Color = CLOUD.alpha(0.6);
+pub const TEXT_TERTIARY: Color = CLOUD.alpha(0.75); // ≥ 4.5:1 on black
 pub const TRACK: Color = IVORY.alpha(0.12);
 pub const CLAWD: Color = CLAUDE_ORANGE;
 pub const CLAWD_EYE: Color = BLACK;
@@ -70,8 +70,8 @@ pub const NUMERAL: Type = Type { size: 12.0, weight: medium, mono: true };
 pub const CAPTION: Type = Type { size: 10.5, weight: regular, mono: true };
 pub const OVERLINE: Type = Type { size: 9.5, weight: medium, mono: false };
 /// Collapsed notch readout; size is scaled to the notch height at draw time.
-pub const MICRO: Type = Type { size: 10.5, weight: medium, mono: true };
-pub const MICRO_LABEL: Type = Type { size: 9.0, weight: regular, mono: false };
+pub const MICRO: Type = Type { size: 11.0, weight: medium, mono: true };
+pub const MICRO_LABEL: Type = Type { size: 9.5, weight: regular, mono: false };
 
 // ---- spacing / shape ----
 pub const WING: f64 = 50.0; // side "ear" width next to the notch

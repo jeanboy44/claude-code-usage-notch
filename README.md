@@ -31,7 +31,16 @@ refresh_secs = 120                           # poll interval, min 30; backs off 
 keychain_service = Claude Code-credentials   # point at another account/profile's Keychain item
 ```
 
-With several accounts, the one you last `/login`'d to is shown. If you separate profiles with `CLAUDE_CONFIG_DIR`, find the item name with `security dump-keychain | grep "Claude Code"` and set `keychain_service`.
+Multiple accounts: by default the account behind the default Keychain item is shown. Recent Claude Code versions store a separate item per `CLAUDE_CONFIG_DIR` (named like `Claude Code-credentials-<hash>`); find yours with `security dump-keychain | grep "Claude Code-credentials"` and set `keychain_service` to show that profile instead.
+
+## Behaviour notes
+
+- Hover must linger ~0.2 s before the panel opens, so sweeping toward menu-bar items doesn't trigger it. It never takes keyboard focus.
+- Clicks are coalesced (at most one fetch per 15 s) and never bypass a 429 backoff.
+- An expired token is detected from `expiresAt` locally, so no request is sent until Claude Code renews it.
+- Numbers dim when they're stale (error or > 10 min old) and the status line shows their age. When a window's reset time passes it shows as full, and a fetch is scheduled right after each reset. After wake from sleep it refreshes within a few seconds; offline retries every 15 s.
+- At 0% left, the collapsed notch shows the countdown to reset instead.
+- Respects Reduce Motion; VoiceOver reads a full summary and "press" refreshes.
 
 ## Design
 
