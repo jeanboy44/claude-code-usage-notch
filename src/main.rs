@@ -1,7 +1,7 @@
 mod theme;
 mod usage;
 
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::ptr::NonNull;
 use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
@@ -11,7 +11,7 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSAccessibilityButtonRole, NSApplication, NSApplicationActivationPolicy,
+    NSAccessibilityButtonRole, NSApplication, NSAutoresizingMaskOptions, NSApplicationActivationPolicy,
     NSApplicationDidChangeScreenParametersNotification, NSBackingStoreType, NSBezierPath, NSColor,
     NSEvent, NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSMainMenuWindowLevel,
     NSMenu, NSMenuItem, NSPanel, NSScreen, NSStringDrawing, NSTrackingArea, NSTrackingAreaOptions,
@@ -20,15 +20,20 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSDate, NSDateFormatter, NSDictionary, NSLocale, NSNotification,
-    NSNotificationCenter, NSPoint, NSRect, NSSize, NSString, NSTimeZone, NSTimer, NSURL,
+    NSNotificationCenter, NSNumber, NSPoint, NSRect, NSSize, NSString, NSTimeZone, NSTimer, NSURL,
+};
+use objc2_core_graphics::CGPath;
+use objc2_quartz_core::{
+    kCAFillModeBoth, kCAMediaTimingFunctionEaseOut, CABasicAnimation, CACurrentMediaTime,
+    CAMediaTiming, CAMediaTimingFunction, CAShapeLayer, CASpringAnimation, CATransaction,
 };
 
-use theme::{Color, Type, EXPANDED_W, FLARE, PAD, WING};
+use theme::{Color, Type, EXPANDED_W, FLARE, PAD};
 use usage::{snapshot, Limit, Snapshot};
 
 const USAGE_PAGE: &str = "https://claude.ai/settings/usage";
-const HOVER_IN_DELAY: f64 = 0.22;
-const HOVER_OUT_DELAY: f64 = 0.3;
+const HOVER_IN_DELAY: f64 = 0.12;
+const HOVER_OUT_DELAY: f64 = 0.12;
 
 static WAKE: OnceLock<Sender<()>> = OnceLock::new();
 
@@ -42,8 +47,14 @@ struct Ivars {
     refreshing: Cell<bool>,
     seen_version: Cell<u64>,
     notch_h: Cell<f64>,
-    /// Final panel height for the current state; content is hidden mid-animation.
-    target_h: Cell<f64>,
+    /// Layout the content is drawn in. Lags `expanded` while collapsing, so the
+    /// expanded content can fade out before the collapsed content appears.
+    shown_expanded: Cell<bool>,
+    /// A morph is in flight; idle relayouts must not fight it.
+    animating: Cell<bool>,
+    anim_gen: Cell<u64>,
+    /// The black blob behind the content (lives on a sibling background view).
+    shape: OnceCell<Retained<CAShapeLayer>>,
 }
 
 // A panel that can never take keyboard focus or become main — the notch must not
@@ -132,9 +143,12 @@ define_class!(
 );
 
 impl NotchView {
-    fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(Ivars::default());
+    fn new(mtm: MainThreadMarker, shape: Retained<CAShapeLayer>) -> Retained<Self> {
+        let ivars = Ivars::default();
+        let _ = ivars.shape.set(shape);
+        let this = Self::alloc(mtm).set_ivars(ivars);
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
+        this.setWantsLayer(true); // content opacity is animated on its layer
         let area = unsafe {
             NSTrackingArea::initWithRect_options_owner_userInfo(
                 NSTrackingArea::alloc(),
@@ -191,35 +205,104 @@ impl NotchView {
         });
     }
 
-    fn set_expanded(&self, on: bool) {
-        if self.ivars().expanded.replace(on) != on {
-            self.relayout(!reduce_motion());
-            if let Some(w) = self.window() {
-                w.setHasShadow(on);
-            }
+    /// Settled (collapsed, expanded) panel frames in screen coordinates.
+    fn frames(&self) -> Option<(NSRect, NSRect)> {
+        let g = Geometry::current(self.mtm())?;
+        self.ivars().notch_h.set(g.notch_h);
+        let snap = snapshot();
+        // Collapsed ears hug their own content, so the two sides may differ in width.
+        let (lw, rw) = Ears::new(snap.as_ref(), g.notch_h, false).widths();
+        let rows = snap.map_or(2, |s| rows(&s).len().max(1)) as f64;
+        let content = theme::HEADER_H + theme::OVERLINE_H + rows * theme::ROW_H + theme::BOTTOM_PAD;
+        let (cw, ew) = (lw + g.notch_w + rw + 2.0 * FLARE, (g.notch_w + 2.0 * FLARE + 2.0 * lw.max(rw)).max(EXPANDED_W));
+        let eh = g.notch_h + 10.0 + content;
+        let notch_left = g.center_x - g.notch_w / 2.0;
+        let collapsed = NSRect::new(pt(notch_left - FLARE - lw, g.top - g.notch_h), NSSize::new(cw, g.notch_h));
+        let expanded = NSRect::new(pt(g.center_x - ew / 2.0, g.top - eh), NSSize::new(ew, eh));
+        Some((collapsed, expanded))
+    }
+
+    fn radius(&self, expanded: bool) -> f64 {
+        if expanded {
+            theme::RADIUS_EXPANDED
+        } else {
+            (self.ivars().notch_h.get() * theme::RADIUS_COLLAPSED_RATIO).min(10.0)
         }
     }
 
-    /// Recompute geometry and resize the panel to the current state.
-    fn relayout(&self, animate: bool) {
-        let Some(window) = self.window() else { return };
-        let Some(g) = Geometry::current(self.mtm()) else { return };
+    /// Dynamic-Island style morph: the window jumps to the larger frame, the black
+    /// shape springs between notch-sized and panel-sized, content fades around it.
+    fn set_expanded(&self, on: bool) {
         let iv = self.ivars();
-        iv.notch_h.set(g.notch_h);
-        let collapsed_w = g.notch_w + 2.0 * (WING + FLARE);
-        let (w, h) = if iv.expanded.get() {
-            let rows = snapshot().map_or(2, |s| rows(&s).len().max(1)) as f64;
-            let content = theme::HEADER_H + theme::OVERLINE_H + rows * theme::ROW_H + theme::BOTTOM_PAD;
-            (collapsed_w.max(EXPANDED_W), g.notch_h + 10.0 + content)
-        } else {
-            (collapsed_w, g.notch_h)
-        };
-        iv.target_h.set(h);
-        let frame = NSRect::new(NSPoint::new(g.center_x - w / 2.0, g.top - h), NSSize::new(w, h));
-        if frame != window.frame() {
-            window.setFrame_display_animate(frame, true, animate);
-            window.invalidateShadow();
+        if iv.expanded.replace(on) == on {
+            return;
         }
+        let (Some(window), Some((collapsed, expanded)), Some(shape)) = (self.window(), self.frames(), iv.shape.get())
+        else {
+            return;
+        };
+        if reduce_motion() {
+            iv.animating.set(false);
+            self.settle();
+            fade(self, 0.0, 1.0, 0.0, 0.18);
+            return;
+        }
+        let gen = iv.anim_gen.get() + 1;
+        iv.anim_gen.set(gen);
+        iv.animating.set(true);
+
+        // Morph inside the expanded frame; start from wherever the shape is now.
+        let from = if window.frame() == expanded {
+            presented_path(shape)
+        } else {
+            window.setFrame_display(expanded, false);
+            Some(notch_path(local(collapsed, expanded), self.radius(false)))
+        };
+        let target = if on { expanded } else { collapsed };
+        let to = notch_path(local(target, expanded), self.radius(on));
+        let settle_in = morph(shape, from.as_deref(), &to, on);
+
+        if on {
+            iv.shown_expanded.set(true);
+            self.setNeedsDisplay(true);
+            fade(self, 0.0, 1.0, 0.1, 0.22);
+        } else {
+            fade(self, -1.0, 0.0, 0.0, 0.1);
+        }
+        let view = self.retain();
+        after(settle_in, move || {
+            let iv = view.ivars();
+            if iv.anim_gen.get() != gen {
+                return; // superseded by a newer morph
+            }
+            iv.animating.set(false);
+            if !iv.expanded.get() {
+                view.settle();
+                fade(&view, 0.0, 1.0, 0.0, 0.16);
+            }
+        });
+    }
+
+    /// Snap window, shape and content to the current state without animation.
+    fn settle(&self) {
+        let iv = self.ivars();
+        if iv.animating.get() {
+            return;
+        }
+        let (Some(window), Some((collapsed, expanded)), Some(shape)) = (self.window(), self.frames(), iv.shape.get())
+        else {
+            return;
+        };
+        let on = iv.expanded.get();
+        let frame = if on { expanded } else { collapsed };
+        if frame != window.frame() {
+            window.setFrame_display(frame, true);
+        }
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        shape.setPath(Some(&notch_path(local(frame, frame), self.radius(on))));
+        CATransaction::commit();
+        iv.shown_expanded.set(on);
         self.setNeedsDisplay(true);
     }
 
@@ -230,10 +313,9 @@ impl NotchView {
         if iv.seen_version.replace(version) != version {
             iv.refreshing.set(false);
             self.update_accessibility();
-            if iv.expanded.get() {
-                self.relayout(false); // row count may have changed
-            }
         }
+        // Row count (expanded) or ear text width (collapsed) may have changed.
+        self.settle();
         iv.blink.set(true);
         self.setNeedsDisplay(true);
         let view = self.retain();
@@ -264,62 +346,45 @@ impl NotchView {
 
     fn draw(&self) {
         let b = self.bounds();
-        let (w, h) = (b.size.width, b.size.height);
+        let w = b.size.width;
         let iv = self.ivars();
         let notch_h = iv.notch_h.get().max(1.0);
-        let expanded = iv.expanded.get();
+        let expanded = iv.shown_expanded.get();
         let scale = self.window().map_or(2.0, |w| w.backingScaleFactor());
         let snap = snapshot();
         let stale = snap.as_ref().is_some_and(|s| s.error.is_some() || usage::now() - s.fetched_at > 600);
         let mood = Mood::of(snap.as_ref());
 
-        // Body: black, square top, rounded bottom, flared top corners.
-        let r = if expanded { theme::RADIUS_EXPANDED } else { (notch_h * 0.42).min(12.0) };
-        let p = NSBezierPath::new();
-        p.moveToPoint(pt(0.0, 0.0));
-        p.curveToPoint_controlPoint1_controlPoint2(pt(FLARE, FLARE), pt(FLARE, 0.0), pt(FLARE, 0.0));
-        p.lineToPoint(pt(FLARE, h - r));
-        p.curveToPoint_controlPoint1_controlPoint2(pt(FLARE + r, h), pt(FLARE, h), pt(FLARE, h));
-        p.lineToPoint(pt(w - FLARE - r, h));
-        p.curveToPoint_controlPoint1_controlPoint2(pt(w - FLARE, h - r), pt(w - FLARE, h), pt(w - FLARE, h));
-        p.lineToPoint(pt(w - FLARE, FLARE));
-        p.curveToPoint_controlPoint1_controlPoint2(pt(w, 0.0), pt(w - FLARE, 0.0), pt(w - FLARE, 0.0));
-        p.closePath();
-        theme::SURFACE.ns().set();
-        p.fill();
-
-        // Mid-animation frames only show the shape, so text never slides or clips.
-        if (h - iv.target_h.get()).abs() > 0.5 {
-            return;
-        }
-
         if !expanded {
-            let s = ((notch_h - 12.0) * 24.0 / 15.0).clamp(18.0, 30.0);
-            critter(FLARE + WING / 2.0 + 4.0, notch_h / 2.0, s, scale, mood, iv.blink.get());
+            let ears = Ears::new(snap.as_ref(), notch_h, stale);
+            // Every piece sits on one baseline, centred on the hero number's cap height.
+            let baseline = notch_h / 2.0 + ears.session_ty.size * 0.36;
+            let top = |ty: &Type| baseline - ty.size * 0.97;
 
-            // Right ear: session (5h) and weekly (7d) left, stacked.
-            let size = (notch_h / 2.9).clamp(9.5, theme::MICRO.size);
-            let lh = size * 1.2;
-            let y0 = (notch_h - 2.0 * lh) / 2.0;
-            let (label_x, num_r) = (w - FLARE - WING + 3.0, w - FLARE - 8.0);
-            let tag_ty = Type { size: size - 1.5, ..theme::MICRO_LABEL };
-            let num_ty = Type { size, ..theme::MICRO };
-            let limits = snap.as_ref().map_or([None, None], |s| [s.five_hour, s.seven_day]);
-            for (i, (tag, l)) in ["5h", "7d"].into_iter().zip(limits).enumerate() {
-                let y = y0 + i as f64 * lh;
-                let (value, color) = match l {
-                    // At 0% the useful number is when it comes back.
-                    Some(l) if l.left() < 1.0 => (
-                        l.resets_at.map_or("0%".to_string(), short_countdown),
-                        theme::remaining(0.0),
-                    ),
-                    Some(l) => (pct(l.left()), theme::remaining(l.left())),
-                    None => ("–".to_string(), theme::TEXT_TERTIARY),
-                };
-                let color = if stale { theme::TEXT_TERTIARY } else { color };
-                text(tag, label_x, y + 1.2, &tag_ty, theme::TEXT_TERTIARY, Align::Left);
-                text(&value, num_r, y, &num_ty, color, Align::Right);
+            let [session, week] = &ears.sides;
+
+            // Left ear: Clawd · [weekly left], anchored to the outer edge.
+            let mut x = FLARE + theme::EAR_OUTER;
+            critter(x + ears.sprite / 2.0, notch_h / 2.0, ears.sprite, scale, mood, iv.blink.get());
+            x += ears.sprite + theme::BADGE_GAP;
+            let bw = measure(&week.value, &ears.week_ty) + 2.0 * theme::BADGE_PAD_X;
+            let bh = ears.week_ty.size + 2.0 * theme::BADGE_PAD_Y;
+            theme::TRACK.ns().set();
+            let br = (bh / 2.0).min(4.0);
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                NSRect::new(pt(x, (notch_h - bh) / 2.0), NSSize::new(bw, bh)),
+                br,
+                br,
+            )
+            .fill();
+            text(&week.value, x + theme::BADGE_PAD_X, top(&ears.week_ty), &ears.week_ty, week.color, Align::Left);
+
+            // Right ear: session left · session reset, anchored to the outer edge.
+            let mut x = w - FLARE - theme::EAR_OUTER;
+            if let Some(r) = &session.reset {
+                x -= text(r, x, top(&ears.reset_ty), &ears.reset_ty, theme::TEXT_TERTIARY, Align::Right) + theme::RESET_GAP;
             }
+            text(&session.value, x, top(&ears.session_ty), &ears.session_ty, session.color, Align::Right);
             return;
         }
 
@@ -367,6 +432,136 @@ impl NotchView {
             text(&reset, right, y, &theme::CAPTION, theme::TEXT_SECONDARY, Align::Right);
         }
     }
+}
+
+/// What the collapsed ears show: `[session, weekly]` → "Clawd [63%] | notch | 94% 4h42".
+struct Ears {
+    sides: [Side; 2],
+    /// Session % — the hero number.
+    session_ty: Type,
+    reset_ty: Type,
+    /// Weekly % in the badge — lighter, secondary.
+    week_ty: Type,
+    sprite: f64,
+}
+
+struct Side {
+    value: String,
+    color: Color,
+    reset: Option<String>,
+}
+
+impl Ears {
+    fn new(snap: Option<&Snapshot>, notch_h: f64, stale: bool) -> Self {
+        let size = (notch_h / 2.9).clamp(9.5, theme::MICRO.size);
+        let side = |l: Option<Limit>| match l {
+            Some(l) => Side {
+                value: pct(l.left()),
+                color: if stale { theme::TEXT_TERTIARY } else { theme::remaining(l.left()) },
+                reset: l.resets_at.filter(|&at| at > usage::now()).map(short_countdown),
+            },
+            None => Side { value: "–".to_string(), color: theme::TEXT_TERTIARY, reset: None },
+        };
+        let (five, week) = snap.map_or((None, None), |s| (s.five_hour, s.seven_day));
+        Ears {
+            sides: [side(five), side(week)],
+            session_ty: Type { size: (size + 1.5).min(notch_h * 0.45), ..theme::MICRO_HERO },
+            reset_ty: Type { size: size - 1.5, ..theme::MICRO_LABEL },
+            week_ty: Type { size: size - 0.5, ..theme::MICRO_SECONDARY },
+            sprite: ((notch_h - 14.0) * 24.0 / 15.0).clamp(16.0, 24.0),
+        }
+    }
+
+    /// Content widths of the (left, right) ears, excluding the flares.
+    /// Both ears get the wider one's width so the blob stays centred on the notch.
+    fn widths(&self) -> (f64, f64) {
+        let [session, week] = &self.sides;
+        let pad = theme::EAR_OUTER + theme::EAR_INNER;
+        let left = self.sprite + theme::BADGE_GAP + measure(&week.value, &self.week_ty) + 2.0 * theme::BADGE_PAD_X;
+        let right = measure(&session.value, &self.session_ty)
+            + session.reset.as_ref().map_or(0.0, |r| theme::RESET_GAP + measure(r, &self.reset_ty));
+        let ear = pad + left.max(right);
+        (ear, ear)
+    }
+}
+
+/// Notch-shaped outline for `r` (view coords, y up): square top with concave flares,
+/// rounded bottom. Every state uses the same element list so paths interpolate.
+fn notch_path(r: NSRect, radius: f64) -> Retained<CGPath> {
+    let (l, rt) = (r.origin.x, r.origin.x + r.size.width);
+    let (b, t) = (r.origin.y, r.origin.y + r.size.height);
+    let p = NSBezierPath::new();
+    p.moveToPoint(pt(l, t));
+    p.curveToPoint_controlPoint1_controlPoint2(pt(l + FLARE, t - FLARE), pt(l + FLARE, t), pt(l + FLARE, t));
+    p.lineToPoint(pt(l + FLARE, b + radius));
+    p.curveToPoint_controlPoint1_controlPoint2(pt(l + FLARE + radius, b), pt(l + FLARE, b), pt(l + FLARE, b));
+    p.lineToPoint(pt(rt - FLARE - radius, b));
+    p.curveToPoint_controlPoint1_controlPoint2(pt(rt - FLARE, b + radius), pt(rt - FLARE, b), pt(rt - FLARE, b));
+    p.lineToPoint(pt(rt - FLARE, t - FLARE));
+    p.curveToPoint_controlPoint1_controlPoint2(pt(rt, t), pt(rt - FLARE, t), pt(rt - FLARE, t));
+    p.closePath();
+    p.CGPath()
+}
+
+/// `r` (screen) expressed in the coordinates of a window whose frame is `win`.
+fn local(r: NSRect, win: NSRect) -> NSRect {
+    NSRect::new(pt(r.origin.x - win.origin.x, r.origin.y - win.origin.y), r.size)
+}
+
+fn cf_obj(path: &CGPath) -> &AnyObject {
+    // CGPath is toll-free bridged to an Objective-C object.
+    unsafe { &*(path as *const CGPath as *const AnyObject) }
+}
+
+/// The shape's path as currently on screen (mid-animation aware).
+fn presented_path(shape: &CAShapeLayer) -> Option<Retained<CGPath>> {
+    let presented = unsafe { shape.presentationLayer() }.and_then(|l| l.downcast::<CAShapeLayer>().ok());
+    presented.and_then(|l| l.path()).or_else(|| shape.path())
+}
+
+/// Spring the shape from `from` to `to`; returns how long until it settles.
+fn morph(shape: &CAShapeLayer, from: Option<&CGPath>, to: &CGPath, expanding: bool) -> f64 {
+    let anim = CASpringAnimation::animationWithKeyPath(Some(ns_string!("path")));
+    // Slightly underdamped on the way out (a hint of bounce), near-critical on the way in.
+    anim.setMass(1.0);
+    anim.setStiffness(if expanding { theme::SPRING_OPEN.0 } else { theme::SPRING_CLOSE.0 });
+    anim.setDamping(if expanding { theme::SPRING_OPEN.1 } else { theme::SPRING_CLOSE.1 });
+    unsafe {
+        anim.setFromValue(from.map(cf_obj));
+        anim.setToValue(Some(cf_obj(to)));
+    }
+    let settle = anim.settlingDuration().min(0.7);
+    anim.setDuration(settle);
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    shape.setPath(Some(to));
+    shape.addAnimation_forKey(&anim, Some(ns_string!("morph")));
+    CATransaction::commit();
+    settle
+}
+
+/// Animate a view's opacity. `from < 0` means "from whatever is on screen now".
+fn fade(view: &NSView, from: f32, to: f32, delay: f64, duration: f64) {
+    let Some(layer) = view.layer() else { return };
+    let from = if from < 0.0 {
+        unsafe { layer.presentationLayer() }.map_or(layer.opacity(), |p| p.opacity())
+    } else {
+        from
+    };
+    let anim = CABasicAnimation::animationWithKeyPath(Some(ns_string!("opacity")));
+    unsafe {
+        anim.setFromValue(Some(&NSNumber::numberWithFloat(from)));
+        anim.setToValue(Some(&NSNumber::numberWithFloat(to)));
+        anim.setFillMode(kCAFillModeBoth);
+    }
+    anim.setBeginTime(CACurrentMediaTime() + delay);
+    anim.setDuration(duration.max(0.01));
+    anim.setTimingFunction(Some(&CAMediaTimingFunction::functionWithName(unsafe { kCAMediaTimingFunctionEaseOut })));
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    view.setAlphaValue(to as f64);
+    layer.addAnimation_forKey(&anim, Some(ns_string!("fade")));
+    CATransaction::commit();
 }
 
 fn wake_worker() {
@@ -441,16 +636,19 @@ impl Geometry {
         let screen = screens.iter().find(|s| s.safeAreaInsets().top > 0.0).or_else(|| screens.firstObject())?;
         let f = screen.frame();
         let inset = screen.safeAreaInsets().top;
-        let (notch_w, notch_h) = if inset > 0.0 {
-            let l = screen.auxiliaryTopLeftArea();
-            let r = screen.auxiliaryTopRightArea();
-            (f.size.width - l.size.width - r.size.width, inset)
+        let (center_x, notch_w, notch_h) = if inset > 0.0 {
+            // Centre on the actual camera cutout, between the two usable top areas.
+            let (l, r) = (screen.auxiliaryTopLeftArea(), screen.auxiliaryTopRightArea());
+            let cut_l = f.origin.x + l.size.width;
+            let cut_r = f.origin.x + f.size.width - r.size.width;
+            ((cut_l + cut_r) / 2.0, cut_r - cut_l, inset)
         } else {
             // No notch: a small pill hanging from the menu bar.
             let vf = screen.visibleFrame();
-            (0.0, (f.origin.y + f.size.height - (vf.origin.y + vf.size.height)).clamp(24.0, 32.0))
+            let h = (f.origin.y + f.size.height - (vf.origin.y + vf.size.height)).clamp(24.0, 32.0);
+            (f.origin.x + f.size.width / 2.0, 0.0, h)
         };
-        Some(Geometry { center_x: f.origin.x + f.size.width / 2.0, top: f.origin.y + f.size.height, notch_w, notch_h })
+        Some(Geometry { center_x, top: f.origin.y + f.size.height, notch_w, notch_h })
     }
 }
 
@@ -549,24 +747,37 @@ enum Align {
     Right,
 }
 
-fn text(s: &str, x: f64, y: f64, ty: &Type, color: Color, align: Align) {
+fn attrs(ty: &Type, color: Color) -> Retained<NSDictionary<NSString, AnyObject>> {
     let font = if ty.mono {
         NSFont::monospacedDigitSystemFontOfSize_weight(ty.size, (ty.weight)())
     } else {
         NSFont::systemFontOfSize_weight(ty.size, (ty.weight)())
     };
     let color = color.ns();
-    let ns = NSString::from_str(s);
     unsafe {
-        let attrs = NSDictionary::<NSString, AnyObject>::from_slices(
+        NSDictionary::from_slices(
             &[NSFontAttributeName, NSForegroundColorAttributeName],
             &[&*font as &AnyObject, &*color as &AnyObject],
-        );
+        )
+    }
+}
+
+fn measure(s: &str, ty: &Type) -> f64 {
+    unsafe { NSString::from_str(s).sizeWithAttributes(Some(&attrs(ty, theme::TEXT_PRIMARY))).width }
+}
+
+/// Draws `s` and returns its width.
+fn text(s: &str, x: f64, y: f64, ty: &Type, color: Color, align: Align) -> f64 {
+    let ns = NSString::from_str(s);
+    let attrs = attrs(ty, color);
+    unsafe {
+        let width = ns.sizeWithAttributes(Some(&attrs)).width;
         let x = match align {
             Align::Left => x,
-            Align::Right => x - ns.sizeWithAttributes(Some(&attrs)).width,
+            Align::Right => x - width,
         };
         ns.drawAtPoint_withAttributes(pt(x, y), Some(&attrs));
+        width
     }
 }
 
@@ -655,14 +866,31 @@ fn main() {
             | NSWindowCollectionBehavior::IgnoresCycle,
     );
 
-    let view = NotchView::new(mtm);
-    panel.setContentView(Some(&view));
-    view.relayout(false);
+    // Background view owns the black shape layer; the content view draws on top.
+    let root = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
+    let bg = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
+    bg.setWantsLayer(true);
+    let shape = CAShapeLayer::new();
+    shape.setFillColor(Some(&theme::SURFACE.ns().CGColor()));
+    shape.setAutoresizingMask(
+        objc2_quartz_core::CAAutoresizingMask::LayerWidthSizable | objc2_quartz_core::CAAutoresizingMask::LayerHeightSizable,
+    );
+    if let Some(layer) = bg.layer() {
+        shape.setFrame(layer.bounds());
+        layer.addSublayer(&shape);
+    }
+    let view = NotchView::new(mtm, shape);
+    for v in [&*bg, &**view] {
+        v.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+        root.addSubview(v);
+    }
+    panel.setContentView(Some(&root));
+    view.settle();
     panel.orderFrontRegardless();
 
     // Displays added/removed/rearranged → re-hug the notch.
     let v = view.clone();
-    let on_screens = RcBlock::new(move |_: NonNull<NSNotification>| v.relayout(false));
+    let on_screens = RcBlock::new(move |_: NonNull<NSNotification>| v.settle());
     let _screens_obs = unsafe {
         NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
             Some(NSApplicationDidChangeScreenParametersNotification),

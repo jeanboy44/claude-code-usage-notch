@@ -1,10 +1,10 @@
 # Notchi Usage
 
-A tiny, cute Claude usage meter that lives in your MacBook notch. Native Rust + AppKit (objc2), no webview, ~420 KB binary, ~0% CPU at idle.
+A tiny, cute Claude usage meter that lives in your MacBook notch. Native Rust + AppKit/Core Animation (objc2), no webview, ~440 KB binary, ~0% CPU at idle. Hover and it springs open like the Dynamic Island. Requires macOS 14+.
 
 ## What it shows
 
-- **Collapsed** — Clawd on the left of the notch; on the right, what's **left** of your session (5h) and weekly (7d) limits.
+- **Collapsed** — left of the notch: Clawd and your weekly % left in a small badge; right: what's **left** of your session and when it resets: `Clawd [63%] | notch | 94% 4h42`.
 - **Hover** — expands to show every limit (Session, Weekly, plus Opus/Sonnet weekly when your plan has them) with a remaining-bar, percentage left, and time until reset.
 - **Click** to refresh now. **Right-click** for Refresh / Quit.
 - Clawd's mood follows your session budget: happy → busy → sweating → dizzy. He blinks now and then.
@@ -35,7 +35,7 @@ Multiple accounts: by default the account behind the default Keychain item is sh
 
 ## Behaviour notes
 
-- Hover must linger ~0.2 s before the panel opens, so sweeping toward menu-bar items doesn't trigger it. It never takes keyboard focus.
+- Hover must linger ~0.12 s before the panel opens, so sweeping toward menu-bar items doesn't trigger it. It never takes keyboard focus.
 - Clicks are coalesced (at most one fetch per 15 s) and never bypass a 429 backoff.
 - An expired token is detected from `expiresAt` locally, so no request is sent until Claude Code renews it.
 - Numbers dim when they're stale (error or > 10 min old) and the status line shows their age. When a window's reset time passes it shows as full, and a fetch is scheduled right after each reset. After wake from sleep it refreshes within a few seconds; offline retries every 15 s.

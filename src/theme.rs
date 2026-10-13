@@ -25,9 +25,13 @@ const BLACK: Color = Color::hex(0x000000); // must stay pure black to blend with
 const IVORY: Color = Color::hex(0xFAF9F5);
 const CLOUD: Color = Color::hex(0xB0AEA5);
 const CLAUDE_ORANGE: Color = Color::hex(0xD97757); // Clawd
-const SKY: Color = Color::hex(0x6A9BCC);
-const AMBER: Color = Color::hex(0xE3A857);
-const BRICK: Color = Color::hex(0xD4524A);
+// Status bands: vivid takes on Anthropic's blue / green plus warm yellow and red,
+// all kept slightly warm so they sit next to Claude clay without clashing.
+const BLUE: Color = Color::hex(0x4EA8F5);
+const GREEN: Color = Color::hex(0x6FCB63);
+const YELLOW: Color = Color::hex(0xF7C33C);
+const RED: Color = Color::hex(0xF2573F);
+const DUSTY_BLUE: Color = Color::hex(0x6A9BCC); // Anthropic accent blue
 
 // ---- semantic roles ----
 pub const SURFACE: Color = BLACK;
@@ -37,14 +41,15 @@ pub const TEXT_TERTIARY: Color = CLOUD.alpha(0.75); // ≥ 4.5:1 on black
 pub const TRACK: Color = IVORY.alpha(0.12);
 pub const CLAWD: Color = CLAUDE_ORANGE;
 pub const CLAWD_EYE: Color = BLACK;
-pub const SWEAT: Color = SKY;
+pub const SWEAT: Color = DUSTY_BLUE;
 
-/// Status by **remaining** percentage: bar fill, % numerals and the collapsed label.
+/// Status by **remaining** percentage: bar fill, % numerals and the collapsed readout.
 pub fn remaining(left: f64) -> Color {
     match left {
-        l if l > 30.0 => CLAUDE_ORANGE, // plenty
-        l if l > 10.0 => AMBER,         // getting low
-        _ => BRICK,                     // nearly out
+        l if l >= 90.0 => BLUE,   // fresh
+        l if l >= 50.0 => GREEN,  // comfortable
+        l if l >= 20.0 => YELLOW, // getting low
+        _ => RED,                 // nearly out
     }
 }
 
@@ -71,14 +76,29 @@ pub const CAPTION: Type = Type { size: 10.5, weight: regular, mono: true };
 pub const OVERLINE: Type = Type { size: 9.5, weight: medium, mono: false };
 /// Collapsed notch readout; size is scaled to the notch height at draw time.
 pub const MICRO: Type = Type { size: 11.0, weight: medium, mono: true };
+/// Collapsed session % (base size + 1.5).
+pub const MICRO_HERO: Type = Type { size: 12.5, weight: medium, mono: true };
+/// Collapsed weekly % in its badge — thinner than the hero.
+pub const MICRO_SECONDARY: Type = Type { size: 10.5, weight: regular, mono: true };
 pub const MICRO_LABEL: Type = Type { size: 9.5, weight: regular, mono: false };
 
 // ---- spacing / shape ----
-pub const WING: f64 = 50.0; // side "ear" width next to the notch
+// collapsed ears are sized to their content
+pub const EAR_OUTER: f64 = 9.0; // content inset from the outer edge
+pub const EAR_INNER: f64 = 5.0; // breathing room next to the camera cutout
+pub const RESET_GAP: f64 = 2.5; // session % ↔ its reset countdown
+pub const BADGE_GAP: f64 = 4.0; // session group ↔ weekly badge
+pub const BADGE_PAD_X: f64 = 3.5; // weekly badge padding (fill = TRACK)
+pub const BADGE_PAD_Y: f64 = 2.5;
 pub const FLARE: f64 = 6.0; // concave top corners melting into the bezel
 pub const EXPANDED_W: f64 = 400.0;
 pub const PAD: f64 = 22.0;
-pub const RADIUS_EXPANDED: f64 = 20.0;
+pub const RADIUS_EXPANDED: f64 = 22.0;
+/// Collapsed bottom radius as a fraction of notch height (≈ the hardware notch).
+pub const RADIUS_COLLAPSED_RATIO: f64 = 0.28;
+/// (stiffness, damping) at mass 1. Open ≈ ζ 0.78 (soft bounce), close ≈ ζ 0.9.
+pub const SPRING_OPEN: (f64, f64) = (300.0, 27.0);
+pub const SPRING_CLOSE: (f64, f64) = (420.0, 37.0);
 pub const HEADER_H: f64 = 46.0;
 pub const OVERLINE_H: f64 = 18.0;
 pub const ROW_H: f64 = 26.0;
