@@ -36,7 +36,9 @@ Multiple accounts: by default the account behind the default Keychain item is sh
 ## Behaviour notes
 
 - Hover must linger ~0.12 s before the panel opens, so sweeping toward menu-bar items doesn't trigger it. It never takes keyboard focus.
-- Clicks are coalesced (at most one fetch per 15 s) and never bypass a 429 backoff.
+- Clicks are coalesced (at most one fetch per 15 s) and never bypass a 429 backoff. On 429 it waits at least 5 min (or the server's `Retry-After`, if longer) and doubles on repeats.
+- The last numbers and the next allowed poll time are cached in `~/Library/Caches/notchi-usage/state.json`, so restarting shows data instantly and never polls early or re-trips a rate limit.
+- Each poll logs one line to stderr (status only, never the token).
 - An expired token is detected from `expiresAt` locally, so no request is sent until Claude Code renews it.
 - Numbers dim when they're stale (error or > 10 min old) and the status line shows their age. When a window's reset time passes it shows as full, and a fetch is scheduled right after each reset. After wake from sleep it refreshes within a few seconds; offline retries every 15 s.
 - At 0% left, the collapsed notch shows the countdown to reset instead.

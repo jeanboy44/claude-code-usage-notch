@@ -13,6 +13,8 @@ const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// Manual refreshes closer together than this are coalesced.
 const MIN_GAP: Duration = Duration::from_secs(15);
 const OFFLINE_RETRY: Duration = Duration::from_secs(15);
+/// Never retry a 429 sooner than this, whatever Retry-After says.
+const MIN_RATE_LIMIT_WAIT: u64 = 300;
 
 #[derive(Clone, Copy, Default)]
 pub struct Limit {
@@ -92,7 +94,8 @@ enum FetchError {
     NoLogin,
     Expired,
     Unauthorized,
-    RateLimited,
+    /// With the server's Retry-After (seconds), if it sent one.
+    RateLimited(Option<u64>),
     Offline,
     Other(&'static str),
 }
@@ -102,7 +105,7 @@ impl FetchError {
         match self {
             FetchError::NoLogin => "Not signed in to Claude Code",
             FetchError::Expired | FetchError::Unauthorized => "Token expired · open Claude Code to renew",
-            FetchError::RateLimited => "Rate limited · backing off",
+            FetchError::RateLimited(_) => "Rate limited · backing off",
             FetchError::Offline => "Offline",
             FetchError::Other(m) => m,
         }
@@ -124,6 +127,20 @@ impl Creds {
 pub fn run(cfg: Config, wake: Receiver<()>) {
     let mut creds: Option<Creds> = None;
     let mut backoff = 1u64;
+
+    // Restore the last numbers so a restart shows data instantly and doesn't re-poll
+    // (or re-trip a 429) before the previous schedule says so.
+    if let Some(cache) = load_cache() {
+        let next_reset = cache.snapshot.and_then(|snap| publish(Ok(snap)));
+        let mut wait = (cache.next_fetch_at - now()).max(0);
+        if let Some(at) = next_reset.filter(|_| !cache.rate_limited) {
+            wait = wait.min((at - now() + 10).max(5));
+        }
+        if !sleep(&wake, Duration::from_secs(wait as u64), !cache.rate_limited) {
+            return;
+        }
+    }
+
     loop {
         // Only touch the Keychain when we have nothing usable.
         if creds.as_ref().is_none_or(Creds::expired) {
@@ -145,29 +162,57 @@ pub fn run(cfg: Config, wake: Receiver<()>) {
             },
         };
 
-        backoff = if matches!(outcome, Err(FetchError::RateLimited)) { (backoff * 2).min(8) } else { 1 };
-        let mut wait = Duration::from_secs(cfg.refresh_secs * backoff);
-        if matches!(outcome, Err(FetchError::Offline)) {
-            wait = wait.min(OFFLINE_RETRY);
-        }
-        if let Some(at) = publish(outcome) {
-            // Re-check just after the next window resets so numbers never go stale.
-            wait = wait.min(Duration::from_secs((at - now() + 10).max(5) as u64));
+        // One line per fetch on stderr (never the token) — handy when run from a terminal.
+        match &outcome {
+            Ok(snap) => eprintln!(
+                "[{}] ok session={:?} weekly={:?}",
+                now(),
+                snap.five_hour.map(|l| l.used),
+                snap.seven_day.map(|l| l.used)
+            ),
+            Err(e) => eprintln!("[{}] error: {}", now(), e.message()),
         }
 
-        let started = Instant::now();
-        loop {
-            match wake.recv_timeout(wait.saturating_sub(started.elapsed())) {
-                Ok(()) => {
-                    while wake.try_recv().is_ok() {}
-                    // Never let clicks hammer the endpoint or skip a 429 backoff.
-                    if backoff == 1 {
-                        wait = wait.min(MIN_GAP);
-                    }
+        let retry_after = match &outcome {
+            Err(FetchError::RateLimited(ra)) => Some(ra.unwrap_or(0).max(MIN_RATE_LIMIT_WAIT)),
+            _ => None,
+        };
+        backoff = if retry_after.is_some() { (backoff * 2).min(8) } else { 1 };
+        let mut wait = cfg.refresh_secs * backoff;
+        if let Some(ra) = retry_after {
+            wait = wait.max(ra);
+        }
+        if matches!(outcome, Err(FetchError::Offline)) {
+            wait = wait.min(OFFLINE_RETRY.as_secs());
+        }
+        let next_reset = publish(outcome);
+        if let Some(at) = next_reset.filter(|_| retry_after.is_none()) {
+            // Re-check just after the next window resets so numbers never go stale.
+            wait = wait.min((at - now() + 10).max(5) as u64);
+        }
+        save_cache(now() + wait as i64, retry_after.is_some());
+
+        // Clicks never hammer the endpoint or skip a 429 backoff.
+        if !sleep(&wake, Duration::from_secs(wait), retry_after.is_none()) {
+            return;
+        }
+    }
+}
+
+/// Waits `wait`, letting manual refreshes cut it short to `MIN_GAP` when allowed.
+/// Returns false once the app is gone.
+fn sleep(wake: &Receiver<()>, mut wait: Duration, allow_manual: bool) -> bool {
+    let started = Instant::now();
+    loop {
+        match wake.recv_timeout(wait.saturating_sub(started.elapsed())) {
+            Ok(()) => {
+                while wake.try_recv().is_ok() {}
+                if allow_manual {
+                    wait = wait.min(MIN_GAP);
                 }
-                Err(RecvTimeoutError::Timeout) => break,
-                Err(RecvTimeoutError::Disconnected) => return,
             }
+            Err(RecvTimeoutError::Timeout) => return true,
+            Err(RecvTimeoutError::Disconnected) => return false,
         }
     }
 }
@@ -186,6 +231,59 @@ fn publish(outcome: Result<Snapshot, FetchError>) -> Option<i64> {
     let next_reset = snap.limits().filter_map(|l| l.resets_at).filter(|&at| at > t).min();
     *guard = Some(snap);
     next_reset
+}
+
+// ---------- on-disk cache: last good numbers + when we may poll next ----------
+
+struct Cache {
+    /// `None` if we never got numbers (e.g. rate limited from the very first poll).
+    snapshot: Option<Snapshot>,
+    next_fetch_at: i64,
+    rate_limited: bool,
+}
+
+fn cache_path() -> Option<String> {
+    Some(format!("{}/Library/Caches/notchi-usage/state.json", std::env::var("HOME").ok()?))
+}
+
+fn save_cache(next_fetch_at: i64, rate_limited: bool) {
+    let Some(path) = cache_path() else { return };
+    let snap = snapshot().unwrap_or_default();
+    let limit = |l: Option<Limit>| l.map(|l| serde_json::json!([l.used, l.resets_at]));
+    let json = serde_json::json!({
+        "fetched_at": snap.fetched_at,
+        "next_fetch_at": next_fetch_at,
+        "rate_limited": rate_limited,
+        "five_hour": limit(snap.five_hour),
+        "seven_day": limit(snap.seven_day),
+        "seven_day_opus": limit(snap.seven_day_opus),
+        "seven_day_sonnet": limit(snap.seven_day_sonnet),
+    });
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, json.to_string());
+}
+
+fn load_cache() -> Option<Cache> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(cache_path()?).ok()?).ok()?;
+    let limit = |k: &str| -> Option<Limit> {
+        let a = v.get(k)?.as_array()?;
+        Some(Limit { used: a.first()?.as_f64()?, resets_at: a.get(1).and_then(Value::as_i64) })
+    };
+    Some(Cache {
+        snapshot: v["fetched_at"].as_i64().filter(|&t| t > 0).map(|fetched_at| Snapshot {
+            five_hour: limit("five_hour"),
+            seven_day: limit("seven_day"),
+            seven_day_opus: limit("seven_day_opus"),
+            seven_day_sonnet: limit("seven_day_sonnet"),
+            fetched_at,
+            error: None,
+            version: 0,
+        }),
+        next_fetch_at: v["next_fetch_at"].as_i64().unwrap_or(0),
+        rate_limited: v["rate_limited"].as_bool().unwrap_or(false),
+    })
 }
 
 fn read_creds(service: &str) -> Option<Creds> {
@@ -211,7 +309,7 @@ fn read_creds(service: &str) -> Option<Creds> {
 fn fetch(token: &str) -> Result<Snapshot, FetchError> {
     // Headers go through stdin so the token never appears in `ps`.
     let mut child = Command::new("/usr/bin/curl")
-        .args(["-sS", "-m", "10", "-A", "notchi-usage/0.1", "-H", "@-", "-w", "\n%{http_code}", USAGE_URL])
+        .args(["-sS", "-m", "10", "-A", "notchi-usage/0.1", "-H", "@-", "-w", "\n%{http_code} %header{retry-after}", USAGE_URL])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -225,11 +323,14 @@ fn fetch(token: &str) -> Result<Snapshot, FetchError> {
     }
     let out = child.wait_with_output().map_err(|_| FetchError::Other("curl failed"))?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let (body, code) = text.rsplit_once('\n').unwrap_or(("", text.as_ref()));
-    match code.trim() {
+    let (body, status) = text.rsplit_once('\n').unwrap_or(("", text.as_ref()));
+    let mut status = status.split_whitespace();
+    let code = status.next().unwrap_or("");
+    let retry_after = status.next().and_then(|v| v.parse::<u64>().ok());
+    match code {
         "200" => {}
         "401" | "403" => return Err(FetchError::Unauthorized),
-        "429" => return Err(FetchError::RateLimited),
+        "429" => return Err(FetchError::RateLimited(retry_after)),
         "000" | "" => return Err(FetchError::Offline),
         c if c.starts_with('5') => return Err(FetchError::Other("Anthropic API is having trouble")),
         _ => return Err(FetchError::Other("Unexpected response")),
