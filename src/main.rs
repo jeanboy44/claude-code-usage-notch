@@ -12,7 +12,8 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSAccessibilityButtonRole, NSApplication, NSAutoresizingMaskOptions, NSApplicationActivationPolicy,
+    NSAccessibilityButtonRole, NSApplication, NSAutoresizingMaskOptions, NSControlStateValueOff,
+    NSControlStateValueOn, NSApplicationActivationPolicy,
     NSAffineTransformNSAppKitAdditions, NSApplicationDidChangeScreenParametersNotification,
     NSBackingStoreType, NSBezierPath, NSColor, NSGraphicsContext,
     NSEvent, NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSMainMenuWindowLevel,
@@ -25,6 +26,7 @@ use objc2_foundation::{
     NSNotificationCenter, NSNumber, NSPoint, NSRect, NSSize, NSString, NSTimeZone, NSTimer, NSURL,
 };
 use objc2_core_graphics::CGPath;
+use objc2_service_management::{SMAppService, SMAppServiceStatus};
 use objc2_quartz_core::{
     kCAFillModeBoth, kCAMediaTimingFunctionEaseOut, CABasicAnimation, CACurrentMediaTime,
     CAMediaTiming, CAMediaTimingFunction, CAShapeLayer, CASpringAnimation, CATransaction,
@@ -175,6 +177,11 @@ define_class!(
             self.refresh();
         }
 
+        #[unsafe(method(toggleLaunchAtLogin:))]
+        fn toggle_launch_at_login(&self, _sender: Option<&AnyObject>) {
+            set_launch_at_login(!launch_at_login());
+        }
+
         #[unsafe(method(openUsagePage:))]
         fn open_usage_page(&self, _sender: Option<&AnyObject>) {
             if let Some(url) = NSURL::URLWithString(&NSString::from_str(USAGE_PAGE)) {
@@ -222,6 +229,19 @@ impl NotchView {
         item(ns_string!("Refresh Now"), sel!(refreshNow:), Some(self));
         item(ns_string!("Open Usage Page"), sel!(openUsagePage:), Some(self));
         menu.addItem(&NSMenuItem::separatorItem(mtm));
+        // Launch at Login (only meaningful for the installed .app).
+        unsafe {
+            let login = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                ns_string!("Launch at Login"),
+                running_as_app().then_some(sel!(toggleLaunchAtLogin:)),
+                ns_string!(""),
+            );
+            login.setTarget(Some(self));
+            login.setEnabled(running_as_app());
+            login.setState(if launch_at_login() { NSControlStateValueOn } else { NSControlStateValueOff });
+            menu.addItem(&login);
+        }
         item(ns_string!("Quit Notchi Usage"), sel!(terminate:), None);
         menu
     }
@@ -971,6 +991,27 @@ fn expanded_height(notch_h: f64, rows: f64) -> f64 {
     notch_h + 10.0 + theme::HEADER_H + theme::OVERLINE_H + rows * theme::ROW_H + graph + theme::BOTTOM_PAD
 }
 
+/// Launch at Login only works for a bundled .app (SMAppService registers the bundle).
+fn running_as_app() -> bool {
+    std::env::current_exe().is_ok_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"))
+}
+
+fn launch_at_login() -> bool {
+    running_as_app() && unsafe { SMAppService::mainAppService().status() } == SMAppServiceStatus::Enabled
+}
+
+fn set_launch_at_login(on: bool) {
+    let service = unsafe { SMAppService::mainAppService() };
+    let result = unsafe { if on { service.registerAndReturnError() } else { service.unregisterAndReturnError() } };
+    if let Err(e) = result {
+        eprintln!("launch at login: {}", e.localizedDescription());
+    }
+    // macOS may want the user to approve it in System Settings → Login Items.
+    if on && unsafe { service.status() } == SMAppServiceStatus::RequiresApproval {
+        unsafe { SMAppService::openSystemSettingsLoginItems() };
+    }
+}
+
 fn wake_worker() {
     if let Some(tx) = WAKE.get() {
         let _ = tx.send(());
@@ -1302,6 +1343,16 @@ fn main() {
     let _ = PREVIEW_WEEK.set(preview);
     let _ = DEMO.set(std::env::args().any(|a| a == "--demo"));
     let args: Vec<String> = std::env::args().collect();
+    // `--launch-at-login=on|off` (run from inside the .app): toggle and exit.
+    if let Some(v) = args.iter().find_map(|a| a.strip_prefix("--launch-at-login=")) {
+        set_launch_at_login(v == "on");
+        println!("launch at login: {}", if launch_at_login() { "on" } else { "off" });
+        return;
+    }
+    if let Some(path) = args.iter().position(|a| a == "--render-icon").and_then(|i| args.get(i + 1)) {
+        render::app_icon(path);
+        return;
+    }
     if let Some(dir) = args.iter().position(|a| a == "--render-readme").and_then(|i| args.get(i + 1)) {
         render::readme_frames(mtm, dir);
         return;

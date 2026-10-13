@@ -1,6 +1,8 @@
 //! `--render-readme <dir>`: draws README images offline with the real drawing code —
 //! PNG frames of the collapsed notch going through every weekly state (turned into a
 //! GIF by `scripts/make_gifs.py`) plus one PNG of the expanded panel.
+//! `--render-icon <png>`: the 1024 px app icon (turned into AppIcon.icns by
+//! `scripts/make_icon.sh`).
 
 use super::*;
 use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSImage};
@@ -171,4 +173,58 @@ fn save_png(image: &NSImage, path: &str) {
     if let Some(png) = png {
         png.writeToFile_atomically(&NSString::from_str(path), true);
     }
+}
+
+/// The app icon: a dark squircle with the notch at the top and Clawd standing on the
+/// weekly bar — five day-segments lit green, two spent.
+#[allow(deprecated)]
+pub fn app_icon(path: &str) {
+    let size = NSSize::new(1024.0, 1024.0);
+    let image = NSImage::initWithSize(NSImage::alloc(), size);
+    image.lockFocusFlipped(true);
+
+    // macOS icon grid: 824 pt squircle inset 100 pt.
+    let tile = NSRect::new(pt(100.0, 100.0), NSSize::new(824.0, 824.0));
+    let squircle = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(tile, 185.0, 185.0);
+    Color::hex(0x1C1C1E).ns().set();
+    squircle.fill();
+    NSGraphicsContext::saveGraphicsState_class();
+    squircle.addClip();
+    // Soft top light, like the rest of the macOS icon family.
+    for i in 0..48 {
+        let k = i as f64 / 48.0;
+        Color::hex(0xFFFFFF).alpha(0.06 * (1.0 - k)).ns().set();
+        NSBezierPath::fillRect(NSRect::new(pt(100.0, 100.0 + k * 520.0), NSSize::new(824.0, 520.0 / 48.0 + 0.5)));
+    }
+    // The notch, hanging from the top edge.
+    theme::SURFACE.ns().set();
+    collapsed_outline_at(pt(512.0 - 170.0, 100.0), 340.0, 92.0, 40.0).fill();
+    NSGraphicsContext::restoreGraphicsState_class();
+
+    // Clawd on the bar, centred below the notch.
+    let sprite = 500.0;
+    let clawd_h = sprite * 15.0 / 24.0;
+    let (seg, gap, bar_h) = (82.0, 18.0, 34.0);
+    let bar_w = 7.0 * seg + 6.0 * gap;
+    let top = 372.0;
+    let bar_y = top + clawd_h + 6.0;
+    critter(512.0, top + clawd_h / 2.0, sprite, 1.0, Mood::Happy, Pose::default());
+    for i in 0..7 {
+        let x = 512.0 - bar_w / 2.0 + i as f64 * (seg + gap);
+        let color = if i < 5 { theme::remaining(70.0) } else { Color::hex(0xFFFFFF).alpha(0.14) };
+        pill(x, bar_y, seg, bar_h, color);
+    }
+
+    image.unlockFocus();
+    save_png(&image, path);
+    println!("rendered {path}");
+}
+
+/// Notch outline (square top with flares, rounded bottom) at `origin` in a flipped context.
+fn collapsed_outline_at(origin: NSPoint, w: f64, h: f64, r: f64) -> Retained<NSBezierPath> {
+    let p = collapsed_outline(w, h, r);
+    let t = NSAffineTransform::transform();
+    t.translateXBy_yBy(origin.x, origin.y);
+    p.transformUsingAffineTransform(&t);
+    p
 }

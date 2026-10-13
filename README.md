@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/icon.png" alt="Notchi Usage icon" width="128"></p>
+
 # Notchi Usage
 
 A tiny, cute Claude usage meter that lives in your MacBook notch. Native Rust + AppKit/Core Animation (objc2), no webview, ~500 KB binary, ~0% CPU at idle. Hover and it springs open like the Dynamic Island. Requires macOS 14+.
@@ -11,7 +13,7 @@ A tiny, cute Claude usage meter that lives in your MacBook notch. Native Rust + 
 - **Collapsed** — all to the left of the notch: Clawd standing on a 7-day weekly bar that drains as you use your weekly budget (when it runs short, he panics and teeters on the edge), then what's **left** of your session and when it resets. Try `--demo` (sweeps the week from 100% to 0% every 40 s) or `--preview-week=15`.
 - **Hover** — expands to show every limit (Session, Weekly, plus Opus/Sonnet weekly when your plan has them) with a remaining-bar, percentage left, and time until reset.
 - **Session graph** — a hairline graph of session % left across the current 5-hour window, with an even-pace guide (built from Notchi's own polls, so it fills in while it runs).
-- **Click** to refresh now. **Right-click** (or ctrl-click) for Refresh Now / Open Usage Page / Quit.
+- **Click** to refresh now. **Right-click** (or ctrl-click) for Refresh Now / Open Usage Page / Launch at Login / Quit.
 - Clawd's mood follows whichever limit is tightest: happy → busy → sweating → dizzy. He blinks now and then.
 
 ## Data & token cost
@@ -26,7 +28,7 @@ Download `NotchiUsage.zip` from the [latest release](https://github.com/jeanboy4
 xattr -dr com.apple.quarantine /Applications/NotchiUsage.app
 ```
 
-Apple Silicon, macOS 14+. Launch at login: System Settings → General → Login Items → add `NotchiUsage.app`.
+Apple Silicon, macOS 14+. To start it automatically, right-click the notch → **Launch at Login** (or run `/Applications/NotchiUsage.app/Contents/MacOS/notchi-usage --launch-at-login=on`).
 
 ## Permissions
 
@@ -65,6 +67,14 @@ Multiple accounts: by default the account behind the default Keychain item is sh
 - Numbers dim when they're stale (error or > 10 min old) and the status line shows their age. When a window's reset time passes it shows as full, and a fetch is scheduled right after each reset. After wake from sleep it refreshes within a few seconds; offline retries every 15 s.
 - Respects Reduce Motion; VoiceOver reads a full summary and "press" refreshes.
 
+## Releasing
+
+```sh
+scripts/release.sh 0.1.3 "What changed"
+```
+
+Builds, signs, zips and publishes a GitHub release. With a Developer ID configured (`DEVELOPER_ID` + a `notarytool` keychain profile — see the header of `scripts/release.sh`) it also notarizes and staples, so users get no Gatekeeper warning.
+
 ## README media
 
 The images above are drawn by the app itself (no screenshots), so they always match the code:
@@ -72,6 +82,7 @@ The images above are drawn by the app itself (no screenshots), so they always ma
 ```sh
 ./target/release/notchi-usage --render-readme /tmp/notchi-readme
 python3 scripts/make_gifs.py /tmp/notchi-readme docs   # needs Pillow
+scripts/make_icon.sh                                    # app icon → assets/AppIcon.icns, docs/icon.png
 ```
 
 ## Design

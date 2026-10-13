@@ -17,7 +17,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSAccessibilityProtocols", "NSApplication", "NSAttributedString", "NSBezierPath", "NSColor",
     "NSEvent", "NSFont", "NSFontDescriptor", "NSGraphics", "NSMenu", "NSMenuItem", "NSPanel", "NSResponder",
     "NSRunningApplication", "NSScreen", "NSStringDrawing", "NSTrackingArea", "NSView", "NSWindow",
-    "NSWorkspace", "NSAnimation", "NSAffineTransform", "NSGraphicsContext", "NSImage", "NSImageRep", "NSBitmapImageRep", "objc2-quartz-core", "objc2-core-graphics",
+    "NSWorkspace", "NSAnimation", "NSAffineTransform", "NSGraphicsContext", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSCell", "objc2-quartz-core", "objc2-core-graphics",
 ] }
 objc2-quartz-core = { version = "0.3", default-features = false, features = [
     "std", "objc2-core-foundation", "objc2-core-graphics", "CALayer", "CAShapeLayer",
@@ -25,6 +25,7 @@ objc2-quartz-core = { version = "0.3", default-features = false, features = [
 ] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGPath", "CGColor"] }
 serde_json = "1"
+objc2-service-management = { version = "0.3", default-features = false, features = ["std", "objc2", "SMAppService", "objc2-foundation"] }
 
 [profile.release]
 opt-level = "s"
