@@ -4,7 +4,7 @@ A tiny, cute Claude usage meter that lives in your MacBook notch. Native Rust + 
 
 ## What it shows
 
-- **Collapsed** — all to the left of the notch: Clawd standing on a 7-day weekly bar that drains as you use your weekly budget (when it runs short, he panics and teeters on the edge), then what's **left** of your session and when it resets. Try `--preview-week=15` to see the teeter.
+- **Collapsed** — all to the left of the notch: Clawd standing on a 7-day weekly bar that drains as you use your weekly budget (when it runs short, he panics and teeters on the edge), then what's **left** of your session and when it resets. Try `--demo` (sweeps the week from 100% to 0% every 40 s) or `--preview-week=15`.
 - **Hover** — expands to show every limit (Session, Weekly, plus Opus/Sonnet weekly when your plan has them) with a remaining-bar, percentage left, and time until reset.
 - **Session graph** — a hairline graph of session % left across the current 5-hour window, with an even-pace guide (built from Notchi's own polls, so it fills in while it runs).
 - **Click** to refresh now. **Right-click** (or ctrl-click) for Refresh Now / Open Usage Page / Quit.

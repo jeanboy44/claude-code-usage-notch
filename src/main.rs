@@ -39,6 +39,35 @@ const HOVER_OUT_DELAY: f64 = 0.12;
 static WAKE: OnceLock<Sender<()>> = OnceLock::new();
 /// `--preview-week=N` pins the weekly % left, to see Clawd's teeter without burning budget.
 static PREVIEW_WEEK: OnceLock<Option<f64>> = OnceLock::new();
+/// `--demo` sweeps the weekly % left from 100 to 0 every 40 s (walk, tremble, teeter).
+static DEMO: OnceLock<bool> = OnceLock::new();
+
+/// A walk from `from` to `to` (pt along the bar) starting at `start` (media time).
+#[derive(Clone, Copy)]
+struct Walk {
+    from: f64,
+    to: f64,
+    start: f64,
+    duration: f64,
+}
+
+impl Default for Walk {
+    fn default() -> Self {
+        Walk { from: f64::NAN, to: f64::NAN, start: 0.0, duration: 0.0 }
+    }
+}
+
+impl Walk {
+    /// (position, still walking) at media time `now`, eased in and out.
+    fn at(self, now: f64) -> (f64, bool) {
+        if self.duration <= 0.0 {
+            return (self.to, false);
+        }
+        let t = ((now - self.start) / self.duration).clamp(0.0, 1.0);
+        let ease = t * t * (3.0 - 2.0 * t);
+        (self.from + (self.to - self.from) * ease, t < 1.0)
+    }
+}
 
 #[derive(Default)]
 struct Ivars {
@@ -58,8 +87,15 @@ struct Ivars {
     anim_gen: Cell<u64>,
     /// The black blob behind the content (lives on a sibling background view).
     shape: OnceCell<Retained<CAShapeLayer>>,
-    /// Redraw timer while Clawd teeters on the edge of the weekly bar.
+    /// Redraw timer while Clawd trembles or teeters on the weekly bar.
     teeter: RefCell<Option<Retained<NSTimer>>>,
+    /// End of the current tremble burst (CACurrentMediaTime), in the yellow band.
+    tremble_until: Cell<f64>,
+    /// Clawd's walk along the weekly bar, as offsets from the bar's left end.
+    walk: Cell<Walk>,
+    /// Fell off at 0%: when he let go (then he pops back up, head only).
+    gone: Cell<bool>,
+    gone_start: Cell<f64>,
 }
 
 // A panel that can never take keyboard focus or become main — the notch must not
@@ -323,14 +359,50 @@ impl NotchView {
         self.update_teeter();
     }
 
-    /// Run a light redraw timer only while Clawd is actually teetering.
+    /// Clawd's displayed offset along the bar for a new `target`: starts a walk when the
+    /// spot he should stand on moves (data changed), else continues the current one.
+    /// Returns (offset, walking, direction −1/0/1).
+    fn walk_to(&self, target: f64) -> (f64, bool, f64) {
+        let iv = self.ivars();
+        let now = CACurrentMediaTime();
+        let mut walk = iv.walk.get();
+        if walk.to.is_nan() || reduce_motion() {
+            walk = Walk { from: target, to: target, start: now, duration: 0.0 };
+        } else if (target - walk.to).abs() > 1e-6 {
+            let (here, _) = walk.at(now);
+            let distance = (target - here).abs();
+            walk = if distance < theme::WALK_MIN {
+                Walk { from: target, to: target, start: now, duration: 0.0 }
+            } else {
+                let duration = (distance / theme::WALK_SPEED).clamp(0.4, 2.5);
+                Walk { from: here, to: target, start: now, duration }
+            };
+            iv.walk.set(walk);
+            self.update_teeter(); // make sure frames keep coming while he walks
+        }
+        iv.walk.set(walk);
+        let (x, walking) = walk.at(now);
+        (x, walking, (walk.to - walk.from).signum())
+    }
+
+    /// Run a light redraw timer only while Clawd is moving: always when teetering (red),
+    /// during short tremble bursts (yellow), never when calm.
     fn update_teeter(&self) {
         let iv = self.ivars();
-        let overhang = || {
+        let stance = {
             let ears = Ears::new(snapshot().as_ref(), iv.notch_h.get(), false);
-            perch(0.0, ears.week_left, ears.sprite).2
+            perch(ears.week_left).1
         };
-        let need = !iv.shown_expanded.get() && !reduce_motion() && overhang() > 0.0;
+        let now = CACurrentMediaTime();
+        let walking = iv.walk.get().at(now).1;
+        let moving = walking
+            || match stance {
+                Stance::Teeter => true,
+                Stance::Gone => now < iv.gone_start.get() + theme::GONE_ANIM,
+                Stance::Tremble => now < iv.tremble_until.get(),
+                Stance::Calm => false,
+            };
+        let need = !iv.shown_expanded.get() && !reduce_motion() && moving;
         let mut timer = iv.teeter.borrow_mut();
         if need && timer.is_none() {
             let view = self.retain();
@@ -338,6 +410,11 @@ impl NotchView {
             let block = RcBlock::new(move |_: NonNull<NSTimer>| {
                 let h = view.bounds().size.height;
                 view.setNeedsDisplayInRect(NSRect::new(pt(0.0, 0.0), NSSize::new(session_text_x(), h)));
+                let iv = view.ivars();
+                let now = CACurrentMediaTime();
+                if iv.tremble_until.get() <= now && !iv.walk.get().at(now).1 {
+                    view.update_teeter(); // burst/walk over → stops unless teetering
+                }
             });
             let t = unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.0 / 12.0, true, &block) };
             t.setTolerance(0.01);
@@ -359,6 +436,9 @@ impl NotchView {
         }
         // Row count (expanded) or ear text width (collapsed) may have changed.
         self.settle();
+        // Yellow band: a short shiver every tick.
+        iv.tremble_until.set(CACurrentMediaTime() + theme::TREMBLE_BURST);
+        self.update_teeter();
         iv.blink.set(true);
         self.setNeedsDisplay(true);
         let view = self.retain();
@@ -408,23 +488,85 @@ impl NotchView {
 
             // Left ear: Clawd standing on the weekly bar (7 day-segments, lit = weekly left).
             let sprite = ears.sprite;
+            let u = sprite / 24.0;
             let clawd_h = sprite * 15.0 / 24.0;
-            let y_top = (notch_h - clawd_h - theme::WEEK_BAR_H) / 2.0;
-            let bar_y = y_top + clawd_h;
+            let bar_y = (notch_h - clawd_h - theme::WEEK_BAR_H) / 2.0 + clawd_h;
             let bar_x = FLARE + theme::EAR_OUTER;
             week_bar(bar_x, bar_y, ears.week_left, ears.week_color);
-            let (cx, edge, panic) = perch(bar_x, ears.week_left, sprite);
-            let tilt = teeter_degrees(panic, ears.week_left);
+            let now = CACurrentMediaTime();
+            let motion = !reduce_motion();
+            let (segments, stance) = perch(ears.week_left);
+            let stand_cy = bar_y - clawd_h / 2.0;
+
             NSGraphicsContext::saveGraphicsState_class();
-            if tilt != 0.0 {
-                // Pivot on the platform edge, like tipping over it.
-                let t = NSAffineTransform::transform();
-                t.translateXBy_yBy(edge, bar_y);
-                t.rotateByDegrees(tilt);
-                t.translateXBy_yBy(-edge, -bar_y);
-                t.concat();
+            // Nothing may spill outside the black blob (e.g. near the rounded corner).
+            collapsed_outline(w, notch_h, self.radius(false)).addClip();
+            let rotate = |pivot: (f64, f64), degrees: f64, shift: f64| {
+                if degrees != 0.0 || shift != 0.0 {
+                    let t = NSAffineTransform::transform();
+                    t.translateXBy_yBy(pivot.0 + shift, pivot.1);
+                    t.rotateByDegrees(degrees);
+                    t.translateXBy_yBy(-pivot.0, -pivot.1);
+                    t.concat();
+                }
+            };
+            if stance == Stance::Gone {
+                // 0%: he lets go, drops out of sight, then pops back up — only his head shows
+                // above the bottom edge. Kept clear of the rounded corner.
+                let (was_x, _) = iv.walk.get().at(now);
+                let from_x = if was_x.is_nan() { bar_x } else { bar_x + was_x };
+                let peek = ((bar_x + 12.0 * u).max(FLARE + self.radius(false) + 12.0 * u), notch_h + 1.5 * u);
+                if !iv.gone.replace(true) {
+                    iv.gone_start.set(if was_x.is_nan() { f64::NEG_INFINITY } else { now });
+                    self.update_teeter();
+                }
+                let t = if motion { now - iv.gone_start.get() } else { f64::INFINITY };
+                let hidden = notch_h + 9.0 * u;
+                let start_y = stand_cy; // where he was teetering
+                let hang_x = from_x;
+                let cy = if t < 0.25 {
+                    let k = t / 0.25;
+                    start_y + (hidden - start_y) * k * k
+                } else if t < 0.8 {
+                    hidden
+                } else if t < theme::GONE_ANIM {
+                    let k = (t - 0.8) / (theme::GONE_ANIM - 0.8);
+                    hidden + (peek.1 - hidden) * (1.0 - (1.0 - k) * (1.0 - k))
+                } else {
+                    peek.1
+                };
+                let cx = if t < 0.25 { hang_x + (peek.0 - hang_x) * (t / 0.25) } else { peek.0 };
+                critter(cx, cy, sprite, scale, Mood::Busy, Pose { blink: iv.blink.get(), ..Pose::default() });
+            } else if stance == Stance::Teeter {
+                iv.gone.set(false);
+                // Red: walk to the very edge of what's left, then teeter over the drop —
+                // leaning and wobbling, wide eyes, open mouth, sweat, flapping arms.
+                let (offset, walking, dir) = self.walk_to(lit_edge(ears.week_left));
+                let cx = bar_x + offset;
+                if !walking {
+                    rotate((cx, bar_y), teeter_degrees(ears.week_left), 0.0);
+                }
+                let step = walking.then(|| (now / 0.14) as i64 % 2 == 0);
+                let pose = Pose { panic: if walking { 0.0 } else { 1.0 }, step, look: dir * 0.6, ..Pose::default() };
+                critter(cx, stand_cy, sprite, scale, mood, pose);
+            } else {
+                iv.gone.set(false);
+                // Walk to the middle of the segments that are left (only moves when a whole
+                // segment goes), then tremble there if yellow.
+                let (offset, walking, dir) = self.walk_to(segments_centre(segments));
+                let cx = bar_x + offset;
+                let shiver = stance == Stance::Tremble && !walking && motion && now < iv.tremble_until.get();
+                if shiver {
+                    let wobble = (now * std::f64::consts::TAU * 13.0).sin();
+                    rotate((cx, bar_y), 1.6 * wobble, 0.5 * wobble);
+                }
+                let face = if stance == Stance::Tremble { Mood::Careful } else { mood }; // sweat drop
+                // Walking: alternate leg pairs every 0.14 s, a tiny bob, eyes toward the way he goes.
+                let step = walking.then(|| (now / 0.14) as i64 % 2 == 0);
+                let bob = if step == Some(true) { -0.4 } else { 0.0 };
+                let pose = Pose { blink: iv.blink.get() && !walking, step, look: dir * 0.6, ..Pose::default() };
+                critter(cx, stand_cy + bob, sprite, scale, face, pose);
             }
-            critter(cx, y_top + clawd_h / 2.0, sprite, scale, mood, iv.blink.get() && panic == 0.0, panic);
             NSGraphicsContext::restoreGraphicsState_class();
 
             // Then session left · session reset, still left of the notch.
@@ -442,7 +584,7 @@ impl NotchView {
 
         // Header: Clawd + mood line + status line.
         let top = notch_h + 10.0;
-        critter(FLARE + PAD + 18.0, top + 18.0, 36.0, scale, mood, iv.blink.get(), 0.0);
+        critter(FLARE + PAD + 18.0, top + 18.0, 36.0, scale, mood, Pose { blink: iv.blink.get(), ..Pose::default() });
         let x = FLARE + PAD + 48.0;
         text(mood.title(), x, top + 4.0, &theme::TITLE, theme::TEXT_PRIMARY, Align::Left);
         let status = match snap.as_ref() {
@@ -607,7 +749,8 @@ impl Ears {
             },
             None => Side { value: "–".to_string(), color: theme::TEXT_TERTIARY, reset: None },
         };
-        let week = match PREVIEW_WEEK.get().copied().flatten() {
+        let demo = DEMO.get().copied().unwrap_or(false).then(|| 100.0 - (usage::now() % 40) as f64 * 2.5);
+        let week = match PREVIEW_WEEK.get().copied().flatten().or(demo) {
             Some(left) => Some(Limit { used: 100.0 - left, resets_at: None }),
             None => week,
         };
@@ -657,36 +800,76 @@ fn week_bar(x: f64, y: f64, left: f64, color: Color) {
     }
 }
 
-/// Where Clawd stands on the weekly bar starting at `bar_x`: (centre x, platform
-/// edge x, panic 0..1). Clawd stays centred while the platform is long enough; as the
-/// edge reaches his feet panic rises, and once it reaches his middle he's pushed along
-/// with it, balancing with his centre right on the edge.
-fn perch(bar_x: f64, left: f64, sprite: f64) -> (f64, f64, f64) {
-    let (seg, gap) = (theme::WEEK_SEG_W, theme::WEEK_SEG_GAP);
-    let units = 7.0 * left.clamp(0.0, 100.0) / 100.0;
-    let full = units.floor();
-    let edge = if units >= 7.0 { bar_x + theme::week_bar_w() } else { bar_x + full * (seg + gap) + (units - full) * seg };
-    let home = bar_x + theme::week_bar_w() / 2.0;
-    let cx = home.min(edge).max(bar_x);
-    let right_foot = cx + sprite * 0.32;
-    let panic = ((right_foot - edge) / (sprite * 0.32)).clamp(0.0, 1.0);
-    (cx, edge, panic)
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Stance {
+    /// Green/blue: standing calmly in the middle of what's left.
+    Calm,
+    /// Yellow: still in the middle, shivering now and then.
+    Tremble,
+    /// Red: pushed to the very edge, about to fall.
+    Teeter,
+    /// 0%: fell off entirely; only his head peeks up from the bottom.
+    Gone,
 }
 
-/// Lean over the drop and wobble — harder and faster the less weekly budget is left.
-fn teeter_degrees(panic: f64, left: f64) -> f64 {
-    if panic <= 0.0 {
-        return 0.0;
-    }
-    let severity = (1.0 - left / 60.0).clamp(0.3, 1.0);
-    let lean = panic * (9.0 + 9.0 * severity);
+/// (segments still lit, stance) for a weekly % left. Clawd only moves when the
+/// segment count changes; the stance follows the status colour bands.
+fn perch(left: f64) -> (usize, Stance) {
+    let units = 7.0 * left.clamp(0.0, 100.0) / 100.0;
+    let segments = (units.ceil() as usize).min(7);
+    let stance = match left {
+        l if l >= theme::BAND_GREEN => Stance::Calm,
+        l if l >= theme::BAND_YELLOW => Stance::Tremble,
+        l if l >= 0.5 => Stance::Teeter,
+        _ => Stance::Gone,
+    };
+    (segments, stance)
+}
+
+/// Lean over the drop and wobble — harder and faster the closer to empty.
+fn teeter_degrees(left: f64) -> f64 {
+    let severity = (1.0 - left / theme::BAND_YELLOW).clamp(0.3, 1.0);
+    let lean = 9.0 + 9.0 * severity;
     if reduce_motion() {
         return lean;
     }
     let period = 1.1 - 0.45 * severity;
     let phase = CACurrentMediaTime() * std::f64::consts::TAU / period;
     // Mostly leaning toward the drop, with quick catches back.
-    lean + panic * (5.0 + 6.0 * severity) * phase.sin()
+    lean + (5.0 + 6.0 * severity) * phase.sin()
+}
+
+/// The collapsed blob's outline in this (flipped) view: square top with flares,
+/// rounded bottom — used to clip Clawd so he never draws outside the black.
+fn collapsed_outline(w: f64, h: f64, r: f64) -> Retained<NSBezierPath> {
+    let p = NSBezierPath::new();
+    p.moveToPoint(pt(0.0, 0.0));
+    p.curveToPoint_controlPoint1_controlPoint2(pt(FLARE, FLARE), pt(FLARE, 0.0), pt(FLARE, 0.0));
+    p.lineToPoint(pt(FLARE, h - r));
+    p.curveToPoint_controlPoint1_controlPoint2(pt(FLARE + r, h), pt(FLARE, h), pt(FLARE, h));
+    p.lineToPoint(pt(w - FLARE - r, h));
+    p.curveToPoint_controlPoint1_controlPoint2(pt(w - FLARE, h - r), pt(w - FLARE, h), pt(w - FLARE, h));
+    p.lineToPoint(pt(w - FLARE, FLARE));
+    p.curveToPoint_controlPoint1_controlPoint2(pt(w, 0.0), pt(w - FLARE, 0.0), pt(w - FLARE, 0.0));
+    p.closePath();
+    p
+}
+
+/// Offset of the middle of the first `n` segments.
+fn segments_centre(n: usize) -> f64 {
+    let span = n.max(1) as f64 * (theme::WEEK_SEG_W + theme::WEEK_SEG_GAP) - theme::WEEK_SEG_GAP;
+    span / 2.0
+}
+
+/// Offset of the end of the lit part of the bar.
+fn lit_edge(left: f64) -> f64 {
+    let (seg, gap) = (theme::WEEK_SEG_W, theme::WEEK_SEG_GAP);
+    let units = 7.0 * left.clamp(0.0, 100.0) / 100.0;
+    if units >= 7.0 {
+        return theme::week_bar_w();
+    }
+    let full = units.floor();
+    full * (seg + gap) + (units - full) * seg
 }
 
 /// Notch-shaped outline for `r` (view coords, y up): square top with concave flares,
@@ -891,11 +1074,21 @@ impl Mood {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct Pose {
+    blink: bool,
+    panic: f64,
+    step: Option<bool>,
+    look: f64,
+}
+
 /// Clawd, drawn from the official Claude Code icon (24×24 viewBox, body spans y 5..20).
 /// `s` is the sprite width; the sprite is 24×15 units, centred on (cx, cy).
 /// Edges are snapped to device pixels so the pixel art stays crisp.
-/// `panic` (0..1) swaps in a startled face and flailing arms.
-fn critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, blink: bool, panic: f64) {
+/// `pose.panic` (0..1) swaps in a startled face and flailing arms; `pose.step` lifts
+/// alternate leg pairs while walking; `pose.look` shifts the eyes (units, ±).
+fn critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, pose: Pose) {
+    let Pose { blink, panic, step, look } = pose;
     let u = s / 24.0;
     let (x0, y0) = (cx - 12.0 * u, cy - 7.5 * u);
     let snap = |v: f64| (v * scale).round() / scale;
@@ -918,8 +1111,10 @@ fn critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, blink: bool, panic:
     rect(3.0, 5.0, 18.0, 12.08); // body
     rect(0.0, 10.95 - flap, 3.0, 3.1); // left arm
     rect(21.0, 10.95 + flap, 3.0, 3.1); // right arm
-    for lx in [4.487, 7.488, 15.0, 18.0] {
-        rect(lx, 17.0, 1.51, 3.0); // legs
+    for (i, lx) in [4.487, 7.488, 15.0, 18.0].into_iter().enumerate() {
+        // Walking: outer-left + inner-right pair, then the other pair, step up.
+        let lifted = step.is_some_and(|phase| phase == (i == 0 || i == 2));
+        rect(lx, 17.0, 1.51, if lifted { 2.0 } else { 3.0 }); // legs
     }
 
     // Eyes are holes in the icon; paint them with the notch black.
@@ -938,7 +1133,7 @@ fn critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, blink: bool, panic:
             _ => (8.1, 2.85),
         };
         for ex in [6.0, 16.51] {
-            rect(ex, eye_top, 1.49, eye_h);
+            rect(ex + look, eye_top, 1.49, eye_h);
         }
     }
 
@@ -1086,6 +1281,7 @@ fn main() {
     let cfg = usage::Config::load();
     let preview = std::env::args().find_map(|a| a.strip_prefix("--preview-week=").and_then(|v| v.parse().ok()));
     let _ = PREVIEW_WEEK.set(preview);
+    let _ = DEMO.set(std::env::args().any(|a| a == "--demo"));
     std::thread::spawn(move || usage::run(cfg, rx));
 
     let panel: Retained<NotchPanel> = unsafe {
@@ -1165,19 +1361,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clawd_stays_centred_while_the_platform_is_long() {
-        let (cx, edge, panic) = perch(0.0, 100.0, 20.0);
-        assert_eq!(cx, theme::week_bar_w() / 2.0);
-        assert_eq!(edge, theme::week_bar_w());
-        assert_eq!(panic, 0.0);
-        assert_eq!(perch(0.0, 80.0, 20.0).2, 0.0);
+    fn stance_follows_the_colour_bands() {
+        assert_eq!(perch(100.0), (7, Stance::Calm));
+        assert_eq!(perch(60.0), (5, Stance::Calm)); // 4.2 units → 5 segments still lit
+        assert_eq!(perch(35.0).1, Stance::Tremble);
+        assert_eq!(perch(10.0), (1, Stance::Teeter));
+        assert_eq!(perch(0.0), (0, Stance::Gone));
     }
 
     #[test]
-    fn clawd_hangs_off_as_the_week_drains() {
-        let (cx, edge, low) = perch(0.0, 20.0, 20.0);
-        assert_eq!(cx, edge); // balancing right on the edge
-        assert_eq!(low, 1.0);
-        assert!(teeter_degrees(1.0, 5.0).abs() > 0.0);
+    fn clawd_only_moves_when_a_whole_segment_goes() {
+        // 60% and 58% both leave 5 segments → same spot.
+        assert_eq!(segments_centre(perch(60.0).0), segments_centre(perch(58.0).0));
+        assert!(segments_centre(5) > segments_centre(4));
+        assert_eq!(segments_centre(7), theme::week_bar_w() / 2.0);
+    }
+
+    #[test]
+    fn teeters_on_the_lit_edge() {
+        assert!((lit_edge(10.0) - 0.7 * theme::WEEK_SEG_W).abs() < 1e-9);
+        assert_eq!(lit_edge(100.0), theme::week_bar_w());
     }
 }

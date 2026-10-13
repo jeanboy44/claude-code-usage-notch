@@ -68,7 +68,16 @@ Expanded panel, under the rows: "THIS SESSION" hairline graph of **session % lef
 
 ## Clawd
 
-In the collapsed notch Clawd stands on the weekly bar. While the lit platform is long he stays centred; as the edge reaches his feet **panic** rises (0 → 1), and once it reaches his middle he's pushed along with it, balancing with his centre right on the edge. Panicking Clawd leans over the drop (pivot = platform edge) by `panic × (9° + 9° × severity)` with a quick wobble (`± 5–11°`, period `1.1 → 0.65 s` as the week drains), shows wide eyes glancing at the drop, an open "o" mouth, two sweat drops and arms flapping in opposite directions. Severity = `1 − left/60` (min 0.3). The redraw timer (12 fps, Clawd's area only) runs only while he's teetering and collapsed; Reduce Motion freezes him at a static lean.
+In the collapsed notch Clawd stands on the weekly bar (sprite ≤ 22 pt, bar under his feet, the pair centred vertically). He only reacts when a **whole segment** goes out (7 segments = 7 days of budget); partial drains within a segment don't move him.
+
+| Weekly left | Band | Behaviour |
+|---|---|---|
+| ≥ 50% | blue / green | Walks to the middle of the segments still lit and stands calmly |
+| 20–50% | yellow | Walks to the middle, then trembles there (±1.6°, ±0.5 pt, 13 Hz for 0.9 s every tick) with a sweat drop |
+| < 20% | red | Walks to the very edge of what's left and **teeters**: leaning over the drop by `9° + 9° × severity` with a `± 5–11°` wobble (period `1.1 → 0.65 s`), wide eyes, open mouth, two sweat drops, flapping arms. Severity = `1 − left/20` (min 0.3) |
+| 0% | — | **Falls**: drops out of sight (0.25 s), a beat later pops back up so only his head peeks above the bottom edge |
+
+Walking: 10 pt/s (0.4–2.5 s, eased), alternating leg pairs every 0.14 s, 0.4 pt bob, eyes toward the direction of travel. Clawd is clipped to the black blob so he never draws outside it. The redraw timer (12 fps, Clawd's area only) runs only while he moves — walking, tremble bursts, teetering, falling — never when calm. Reduce Motion: no walk/shiver/wobble; static lean in red, head already peeking at 0%. `--demo` sweeps the week 100 → 0% every 40 s. Band floors live in `theme.rs` (`BAND_GREEN`, `BAND_YELLOW`) and are shared with the status colours.
 
 
 Drawn from the official Claude Code icon path (24×24 viewBox) as nine rectangles. Moods by the tightest remaining limit: `> 50%` happy, `> 30%` busy, `> 10%` sweating, `≤ 10%` dizzy (squint + sweat), no data = asleep (closed eyes + "z"). Blinks at a random 2.5–6 s interval. Rect edges are snapped to device pixels so the pixel art stays crisp.

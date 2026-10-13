@@ -43,12 +43,24 @@ pub const CLAWD: Color = CLAUDE_ORANGE;
 pub const CLAWD_EYE: Color = BLACK;
 pub const SWEAT: Color = DUSTY_BLUE;
 
+/// Band floors (% left) shared by colours and Clawd's stance.
+pub const BAND_BLUE: f64 = 90.0;
+pub const BAND_GREEN: f64 = 50.0;
+pub const BAND_YELLOW: f64 = 20.0;
+/// Seconds Clawd shivers per tick in the yellow band.
+pub const TREMBLE_BURST: f64 = 0.9;
+/// Clawd walks to his new spot at this speed (pt/s); shorter moves just snap.
+pub const WALK_SPEED: f64 = 10.0;
+pub const WALK_MIN: f64 = 0.75;
+/// 0%: let go (0.25 s), out of sight, then pop up head-only — whole sequence (s).
+pub const GONE_ANIM: f64 = 1.25;
+
 /// Status by **remaining** percentage: bar fill, % numerals and the collapsed readout.
 pub fn remaining(left: f64) -> Color {
     match left {
-        l if l >= 90.0 => BLUE,   // fresh
-        l if l >= 50.0 => GREEN,  // comfortable
-        l if l >= 20.0 => YELLOW, // getting low
+        l if l >= BAND_BLUE => BLUE,     // fresh
+        l if l >= BAND_GREEN => GREEN,   // comfortable
+        l if l >= BAND_YELLOW => YELLOW, // getting low
         _ => RED,                 // nearly out
     }
 }
