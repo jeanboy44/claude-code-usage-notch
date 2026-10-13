@@ -221,7 +221,8 @@ impl NotchView {
         // flare hide behind the hardware and only the notch's own curve shows.
         let rw = -(g.notch_w / 2.0);
         let rows = snap.map_or(2, |s| rows(&s).len().max(1)) as f64;
-        let content = theme::HEADER_H + theme::OVERLINE_H + rows * theme::ROW_H + theme::BOTTOM_PAD;
+        let graph = theme::GRAPH_GAP + theme::OVERLINE_H + theme::GRAPH_H + theme::GRAPH_AXIS_H;
+        let content = theme::HEADER_H + theme::OVERLINE_H + rows * theme::ROW_H + graph + theme::BOTTOM_PAD;
         let (cw, ew) = (lw + g.notch_w + rw + 2.0 * FLARE, (g.notch_w + 2.0 * FLARE + 2.0 * lw.max(rw)).max(EXPANDED_W));
         let eh = g.notch_h + 10.0 + content;
         let notch_left = g.center_x - g.notch_w / 2.0;
@@ -259,15 +260,20 @@ impl NotchView {
         iv.anim_gen.set(gen);
         iv.animating.set(true);
 
-        // Morph inside the expanded frame; start from wherever the shape is now.
-        let from = if window.frame() == expanded {
-            presented_path(shape)
+        // Morph inside a panel-sized window, starting from whatever is on screen. Only a
+        // collapsed-size window is grown first; an already-large one (open, or mid-morph)
+        // is kept as is, so text width changes can't make us restart from the wrong shape.
+        let current = window.frame();
+        let (morph_frame, from) = if current.size.height > collapsed.size.height + 0.5 {
+            (current, presented_path(shape))
         } else {
+            // Freshly grown: the presentation layer still holds the old small-window path
+            // (which would sit at the bottom), so start explicitly from the notch at the top.
             window.setFrame_display(expanded, false);
-            Some(notch_path(local(collapsed, expanded), self.radius(false)))
+            (expanded, Some(notch_path(local(collapsed, expanded), self.radius(false))))
         };
         let target = if on { expanded } else { collapsed };
-        let to = notch_path(local(target, expanded), self.radius(on));
+        let to = notch_path(local(target, morph_frame), self.radius(on));
         let settle_in = morph(shape, from.as_deref(), &to, on);
 
         if on {
@@ -276,7 +282,7 @@ impl NotchView {
             self.setNeedsDisplay(true);
             fade(self, 0.0, 1.0, 0.1, 0.22);
         } else {
-            fade(self, -1.0, 0.0, 0.0, 0.1);
+            fade(self, -1.0, 0.0, 0.0, 0.07);
         }
         let view = self.retain();
         after(settle_in, move || {
@@ -285,9 +291,10 @@ impl NotchView {
                 return; // superseded by a newer morph
             }
             iv.animating.set(false);
-            if !iv.expanded.get() {
-                view.settle();
-                fade(&view, 0.0, 1.0, 0.0, 0.16);
+            let collapsed = !iv.expanded.get();
+            view.settle(); // snap the window to the exact final frame
+            if collapsed {
+                fade(&view, 0.0, 1.0, 0.0, 0.1);
             }
         });
     }
@@ -476,6 +483,97 @@ impl NotchView {
             };
             text(&reset, right, y, &theme::CAPTION, theme::TEXT_SECONDARY, Align::Right);
         }
+
+        let gy = oy + theme::OVERLINE_H + rows(&snap).len() as f64 * theme::ROW_H + theme::GRAPH_GAP;
+        history_graph(&snap, left, gy, right - left, stale);
+    }
+}
+
+/// "THIS SESSION" hairline graph of session % left across the current 5 h window,
+/// with a faint even-pace diagonal from 100% to 0% and hour gridlines.
+fn history_graph(snap: &Snapshot, x: f64, y: f64, w: f64, stale: bool) {
+    let session = snap.five_hour;
+    let color = match session {
+        Some(l) if !stale => theme::remaining(l.left()),
+        _ => theme::TEXT_TERTIARY,
+    };
+    text("THIS SESSION", x, y, &theme::OVERLINE, theme::TEXT_TERTIARY, Align::Left);
+    // Axis times are local; say which zone.
+    let tz = NSTimeZone::systemTimeZone();
+    if let Some(abbr) = tz.abbreviation() {
+        text(&abbr.to_string(), x + w, y, &theme::OVERLINE, theme::TEXT_TERTIARY, Align::Right);
+    }
+
+    let gy = y + theme::OVERLINE_H;
+    let h = theme::GRAPH_H;
+    let now = usage::now();
+    let t1 = session.and_then(|l| l.resets_at).filter(|&at| at > now).unwrap_or(now);
+    let t0 = t1 - 5 * 3600;
+    let px = |t: i64| x + (t - t0) as f64 / (t1 - t0) as f64 * w;
+    let py = |left: f64| gy + (1.0 - left.clamp(0.0, 100.0) / 100.0) * h;
+    let line = |pts: &[(f64, f64)], color: Color, width: f64| {
+        if pts.len() < 2 {
+            return;
+        }
+        let p = NSBezierPath::new();
+        p.setLineWidth(width);
+        p.setLineJoinStyle(objc2_app_kit::NSLineJoinStyle::Round);
+        p.moveToPoint(pt(pts[0].0, pts[0].1));
+        for &(a, b) in &pts[1..] {
+            p.lineToPoint(pt(a, b));
+        }
+        color.ns().set();
+        p.stroke();
+    };
+
+    // Grid: 50 / 100 % faint, 0 % is the x-axis; even-pace guide.
+    for left in [50.0, 100.0] {
+        line(&[(x, py(left)), (x + w, py(left))], theme::GRAPH_GRID, 0.5);
+    }
+    line(&[(px(t0), py(100.0)), (px(t1), py(0.0))], theme::GRAPH_PACE, 0.5);
+    let axis_y = py(0.0);
+    line(&[(x, axis_y), (x + w, axis_y)], theme::GRAPH_AXIS, 0.5);
+
+    // Hour ticks on *local* hour boundaries (handles :30 / :45 offset zones), labelled HH:mm.
+    let offset = tz.secondsFromGMT() as i64;
+    let mut tick = ((t0 + offset) as f64 / 3600.0).ceil() as i64 * 3600 - offset;
+    while tick <= t1 {
+        let tx = px(tick);
+        line(&[(tx, gy), (tx, axis_y)], theme::GRAPH_GRID, 0.5);
+        line(&[(tx, axis_y), (tx, axis_y + 3.0)], theme::GRAPH_AXIS, 0.5);
+        let label = clock(tick);
+        let lw = measure(&label, &theme::AXIS);
+        let lx = (tx - lw / 2.0).clamp(x, x + w - lw);
+        text(&label, lx, axis_y + 4.0, &theme::AXIS, theme::TEXT_TERTIARY, Align::Left);
+        tick += 3600;
+    }
+    // Where we are in the window.
+    if now > t0 && now < t1 {
+        let nx = px(now);
+        line(&[(nx, gy), (nx, axis_y)], theme::GRAPH_NOW, 0.5);
+    }
+
+    let samples: Vec<_> = usage::history().into_iter().filter(|s| s.t >= t0).collect();
+    if samples.len() < 2 {
+        text("Fills in as this session goes", x + w / 2.0 - 64.0, gy + h / 2.0 - 7.0, &theme::CAPTION, theme::TEXT_TERTIARY, Align::Left);
+    }
+    // Gaps > 30 min (app not running) aren't joined.
+    let mut runs: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut last_t = i64::MIN;
+    for s in &samples {
+        let p = (px(s.t), py(100.0 - s.session as f64));
+        match runs.last_mut() {
+            Some(run) if s.t - last_t <= 1800 => run.push(p),
+            _ => runs.push(vec![p]),
+        }
+        last_t = s.t;
+    }
+    for run in &runs {
+        line(run, color, theme::GRAPH_LINE);
+    }
+    if let Some(&(cx, cy)) = runs.last().and_then(|r| r.last()) {
+        color.ns().set();
+        NSBezierPath::bezierPathWithOvalInRect(NSRect::new(pt(cx - 1.75, cy - 1.75), NSSize::new(3.5, 3.5))).fill();
     }
 }
 
@@ -636,7 +734,8 @@ fn morph(shape: &CAShapeLayer, from: Option<&CGPath>, to: &CGPath, expanding: bo
         anim.setFromValue(from.map(cf_obj));
         anim.setToValue(Some(cf_obj(to)));
     }
-    let settle = anim.settlingDuration().min(0.7);
+    // Closing is critically damped, so it's visually done well before `settlingDuration`.
+    let settle = anim.settlingDuration().min(if expanding { 0.7 } else { 0.26 });
     anim.setDuration(settle);
     CATransaction::begin();
     CATransaction::setDisableActions(true);
@@ -939,6 +1038,22 @@ fn short_countdown(at: i64) -> String {
         (0, _) => format!("{h}h{m:02}"),
         _ => format!("{d}d{h}h"),
     }
+}
+
+/// Local wall-clock "HH:mm" for axis ticks.
+fn clock(at: i64) -> String {
+    thread_local! {
+        static FMT: Retained<NSDateFormatter> = {
+            let f = NSDateFormatter::new();
+            f.setLocale(Some(&NSLocale::initWithLocaleIdentifier(NSLocale::alloc(), ns_string!("en_US_POSIX"))));
+            f.setDateFormat(Some(ns_string!("HH:mm")));
+            f
+        };
+    }
+    FMT.with(|f| {
+        f.setTimeZone(Some(&NSTimeZone::systemTimeZone()));
+        f.stringFromDate(&NSDate::dateWithTimeIntervalSince1970(at as f64)).to_string()
+    })
 }
 
 /// "1h 23m · 14:30" / "2d 5h · Fri 09:00"

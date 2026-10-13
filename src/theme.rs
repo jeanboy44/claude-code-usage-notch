@@ -78,6 +78,8 @@ pub const OVERLINE: Type = Type { size: 9.5, weight: medium, mono: false };
 pub const MICRO: Type = Type { size: 11.0, weight: medium, mono: true };
 /// Collapsed session % (base size + 1.5).
 pub const MICRO_HERO: Type = Type { size: 12.5, weight: medium, mono: true };
+/// Graph x-axis hour labels.
+pub const AXIS: Type = Type { size: 9.0, weight: regular, mono: true };
 pub const MICRO_LABEL: Type = Type { size: 9.5, weight: regular, mono: false };
 
 // ---- spacing / shape ----
@@ -101,13 +103,24 @@ pub const RADIUS_EXPANDED: f64 = 22.0;
 /// (capped to a fraction of the notch height for unusually short menu bars).
 pub const RADIUS_COLLAPSED: f64 = 14.0;
 pub const RADIUS_COLLAPSED_MAX_RATIO: f64 = 0.45;
-/// (stiffness, damping) at mass 1. Open ≈ ζ 0.78 (soft bounce), close ≈ ζ 0.9.
+/// (stiffness, damping) at mass 1. Open ≈ ζ 0.78 (soft bounce), close ≈ ζ 1 (no overshoot).
 pub const SPRING_OPEN: (f64, f64) = (300.0, 27.0);
-pub const SPRING_CLOSE: (f64, f64) = (420.0, 37.0);
+pub const SPRING_CLOSE: (f64, f64) = (650.0, 51.0); // ≈ critical: snaps back in ~0.25 s
 pub const HEADER_H: f64 = 46.0;
 pub const OVERLINE_H: f64 = 18.0;
 pub const ROW_H: f64 = 26.0;
 pub const BOTTOM_PAD: f64 = 14.0;
+// history graph under the rows
+pub const GRAPH_GAP: f64 = 10.0;
+pub const GRAPH_H: f64 = 56.0;
+/// Hairline stroke for the session line.
+pub const GRAPH_LINE: f64 = 1.0;
+pub const GRAPH_GRID: Color = IVORY.alpha(0.07);
+pub const GRAPH_PACE: Color = CLOUD.alpha(0.3);
+pub const GRAPH_AXIS: Color = IVORY.alpha(0.3);
+pub const GRAPH_NOW: Color = IVORY.alpha(0.35);
+/// Room under the graph for hour labels.
+pub const GRAPH_AXIS_H: f64 = 16.0;
 pub const BAR_H: f64 = 7.0;
 // row columns, measured from the content edges
 pub const COL_BAR_X: f64 = 48.0; // from left

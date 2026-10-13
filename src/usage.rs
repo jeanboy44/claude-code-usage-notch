@@ -54,6 +54,40 @@ impl Snapshot {
 
 static STATE: Mutex<Option<Snapshot>> = Mutex::new(None);
 
+/// One poll's worth of % used, for the history graph. The API has no history,
+/// so we build our own from successful polls.
+#[derive(Clone, Copy)]
+pub struct Sample {
+    pub t: i64,
+    /// Session (5 h) % used.
+    pub session: f32,
+}
+
+static HISTORY: Mutex<Vec<Sample>> = Mutex::new(Vec::new());
+/// Keep a bit more than one session window so the graph's left edge is covered.
+const HISTORY_SPAN: i64 = 6 * 3600;
+/// Unchanged values are only re-recorded this often.
+const HISTORY_HEARTBEAT: i64 = 300;
+
+pub fn history() -> Vec<Sample> {
+    HISTORY.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn record(s: &Snapshot) {
+    let Some(five) = s.five_hour else { return };
+    let sample = Sample { t: s.fetched_at, session: five.used as f32 };
+    let mut h = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(last) = h.last() {
+        let same = last.session == sample.session;
+        if sample.t <= last.t || (same && sample.t - last.t < HISTORY_HEARTBEAT) {
+            return;
+        }
+    }
+    h.push(sample);
+    let cutoff = sample.t - HISTORY_SPAN;
+    h.retain(|x| x.t >= cutoff);
+}
+
 fn state() -> MutexGuard<'static, Option<Snapshot>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -223,7 +257,10 @@ fn publish(outcome: Result<Snapshot, FetchError>) -> Option<i64> {
     let prev = guard.take();
     let version = prev.as_ref().map_or(0, |p| p.version) + 1;
     let snap = match outcome {
-        Ok(s) => Snapshot { version, ..s },
+        Ok(s) => {
+            record(&s);
+            Snapshot { version, ..s }
+        }
         // Keep the last good numbers; the UI shows their age next to the error.
         Err(e) => Snapshot { error: Some(e.message()), version, ..prev.unwrap_or_default() },
     };
@@ -258,6 +295,7 @@ fn save_cache(next_fetch_at: i64, rate_limited: bool) {
         "seven_day": limit(snap.seven_day),
         "seven_day_opus": limit(snap.seven_day_opus),
         "seven_day_sonnet": limit(snap.seven_day_sonnet),
+        "history": history().iter().map(|x| serde_json::json!([x.t, x.session])).collect::<Vec<_>>(),
     });
     if let Some(dir) = std::path::Path::new(&path).parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -267,6 +305,13 @@ fn save_cache(next_fetch_at: i64, rate_limited: bool) {
 
 fn load_cache() -> Option<Cache> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(cache_path()?).ok()?).ok()?;
+    if let Some(points) = v["history"].as_array() {
+        let samples = points.iter().filter_map(|p| {
+            let p = p.as_array()?;
+            Some(Sample { t: p.first()?.as_i64()?, session: p.get(1)?.as_f64()? as f32 })
+        });
+        *HISTORY.lock().unwrap_or_else(|e| e.into_inner()) = samples.collect();
+    }
     let limit = |k: &str| -> Option<Limit> {
         let a = v.get(k)?.as_array()?;
         Some(Limit { used: a.first()?.as_f64()?, resets_at: a.get(1).and_then(Value::as_i64) })

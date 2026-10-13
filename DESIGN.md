@@ -42,7 +42,7 @@ Clawd always stays Claude clay `#D97757`; status colour never touches the mascot
 | `CAPTION` | 10.5 regular, tabular | reset time, status line |
 | `OVERLINE` | 9.5 medium caps | column headers |
 | `MICRO_HERO` | ≤ 12.5 medium, tabular | collapsed session % (largest) |
-| `MICRO_SECONDARY` | ≤ 10.5 regular, tabular | collapsed weekly % in badge |
+| `AXIS` | 9 regular, tabular | graph hour labels |
 | `MICRO_LABEL` | ≤ 9.5 regular | collapsed reset countdown |
 
 Collapsed pieces share one baseline.
@@ -56,11 +56,15 @@ Collapsed pieces share one baseline.
 ## Interaction
 
 - Hover-in delay 0.12 s, hover-out delay 0.12 s (cancelled if the pointer returns).
-- Dynamic-Island morph: the black blob is a `CAShapeLayer` that springs between the notch-sized and panel-sized outline (open: stiffness 300 / damping 27, a hint of bounce; close: 420 / 37, near-critical). Content fades in 0.1 s after the blob starts opening and fades out first when closing. Mid-flight reversals start from the on-screen shape. Reduce Motion → instant swap + crossfade.
+- Dynamic-Island morph: the black blob is a `CAShapeLayer` that springs between the notch-sized and panel-sized outline (open: stiffness 300 / damping 27, a hint of bounce; close: 650 / 51, critically damped — lands in ~0.26 s, then the collapsed content fades in over 0.1 s). Content fades in 0.1 s after the blob starts opening and fades out first when closing. Mid-flight reversals start from the on-screen shape. Reduce Motion → instant swap + crossfade.
 - No shadow, ever — like the hardware notch and Dynamic Island, it's pure black.
 - Collapsed corners copy the hardware notch: bottom radius `14` (capped at 0.45 × notch height), top flare `6`. The right end hides inside the cutout, so the left end is the only drawn corner and it mirrors the hardware's right side. Expanded radius 22.
 - Click = refresh (shows "Refreshing…"), right/ctrl-click = menu (Refresh Now, Open Usage Page, Quit).
 - Stale data (error or > 10 min) renders numbers in `TEXT_TERTIARY`.
+
+## Session graph
+
+Expanded panel, under the rows: "THIS SESSION" hairline graph of **session % left** across the current 5 h window (left edge = reset − 5 h, right edge = session reset). Session line `1 pt` in its status colour with a `3.5 pt` dot at the latest point; even-pace diagonal (100% → 0%) and 50/100% gridlines at `0.5 pt`, very faint. The 0% line is the x-axis (Ivory @ 30%) with ticks and `HH:mm` labels (9 pt tabular, tertiary) on **local** hour boundaries — computed from the system time zone's offset, so :30/:45 zones tick on their own hours — and the zone abbreviation (e.g. `KST`) at the top right. A faint vertical line marks *now*. Height `56` + `16` for labels. Gaps > 30 min (app not running) aren't joined. The API has no history, so samples are recorded from our own polls (on change, or every 5 min) and kept 6 h in the cache file.
 
 ## Clawd
 
