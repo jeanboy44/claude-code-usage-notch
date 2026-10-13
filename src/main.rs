@@ -1,3 +1,4 @@
+mod render;
 mod theme;
 mod usage;
 
@@ -257,10 +258,8 @@ impl NotchView {
         // flare hide behind the hardware and only the notch's own curve shows.
         let rw = -(g.notch_w / 2.0);
         let rows = snap.map_or(2, |s| rows(&s).len().max(1)) as f64;
-        let graph = theme::GRAPH_GAP + theme::OVERLINE_H + theme::GRAPH_H + theme::GRAPH_AXIS_H;
-        let content = theme::HEADER_H + theme::OVERLINE_H + rows * theme::ROW_H + graph + theme::BOTTOM_PAD;
         let (cw, ew) = (lw + g.notch_w + rw + 2.0 * FLARE, (g.notch_w + 2.0 * FLARE + 2.0 * lw.max(rw)).max(EXPANDED_W));
-        let eh = g.notch_h + 10.0 + content;
+        let eh = expanded_height(g.notch_h, rows);
         let notch_left = g.center_x - g.notch_w / 2.0;
         let collapsed = NSRect::new(pt(notch_left - FLARE - lw, g.top - g.notch_h), NSSize::new(cw, g.notch_h));
         let expanded = NSRect::new(pt(g.center_x - ew / 2.0, g.top - eh), NSSize::new(ew, eh));
@@ -364,7 +363,7 @@ impl NotchView {
     /// Returns (offset, walking, direction −1/0/1).
     fn walk_to(&self, target: f64) -> (f64, bool, f64) {
         let iv = self.ivars();
-        let now = CACurrentMediaTime();
+        let now = media_now();
         let mut walk = iv.walk.get();
         if walk.to.is_nan() || reduce_motion() {
             walk = Walk { from: target, to: target, start: now, duration: 0.0 };
@@ -393,7 +392,7 @@ impl NotchView {
             let ears = Ears::new(snapshot().as_ref(), iv.notch_h.get(), false);
             perch(ears.week_left).1
         };
-        let now = CACurrentMediaTime();
+        let now = media_now();
         let walking = iv.walk.get().at(now).1;
         let moving = walking
             || match stance {
@@ -411,7 +410,7 @@ impl NotchView {
                 let h = view.bounds().size.height;
                 view.setNeedsDisplayInRect(NSRect::new(pt(0.0, 0.0), NSSize::new(session_text_x(), h)));
                 let iv = view.ivars();
-                let now = CACurrentMediaTime();
+                let now = media_now();
                 if iv.tremble_until.get() <= now && !iv.walk.get().at(now).1 {
                     view.update_teeter(); // burst/walk over → stops unless teetering
                 }
@@ -437,7 +436,7 @@ impl NotchView {
         // Row count (expanded) or ear text width (collapsed) may have changed.
         self.settle();
         // Yellow band: a short shiver every tick.
-        iv.tremble_until.set(CACurrentMediaTime() + theme::TREMBLE_BURST);
+        iv.tremble_until.set(media_now() + theme::TREMBLE_BURST);
         self.update_teeter();
         iv.blink.set(true);
         self.setNeedsDisplay(true);
@@ -493,7 +492,7 @@ impl NotchView {
             let bar_y = (notch_h - clawd_h - theme::WEEK_BAR_H) / 2.0 + clawd_h;
             let bar_x = FLARE + theme::EAR_OUTER;
             week_bar(bar_x, bar_y, ears.week_left, ears.week_color);
-            let now = CACurrentMediaTime();
+            let now = media_now();
             let motion = !reduce_motion();
             let (segments, stance) = perch(ears.week_left);
             let stand_cy = bar_y - clawd_h / 2.0;
@@ -515,7 +514,9 @@ impl NotchView {
                 // above the bottom edge. Kept clear of the rounded corner.
                 let (was_x, _) = iv.walk.get().at(now);
                 let from_x = if was_x.is_nan() { bar_x } else { bar_x + was_x };
-                let peek = ((bar_x + 12.0 * u).max(FLARE + self.radius(false) + 12.0 * u), notch_h + 1.5 * u);
+                // Head pokes up to just under the bar, eyes showing; the rest is below the edge.
+                let peek_cy = bar_y + theme::WEEK_BAR_H + 0.5 + 7.5 * u;
+                let peek = ((bar_x + 12.0 * u).max(FLARE + self.radius(false) + 12.0 * u), peek_cy);
                 if !iv.gone.replace(true) {
                     iv.gone_start.set(if was_x.is_nan() { f64::NEG_INFINITY } else { now });
                     self.update_teeter();
@@ -834,7 +835,7 @@ fn teeter_degrees(left: f64) -> f64 {
         return lean;
     }
     let period = 1.1 - 0.45 * severity;
-    let phase = CACurrentMediaTime() * std::f64::consts::TAU / period;
+    let phase = media_now() * std::f64::consts::TAU / period;
     // Mostly leaning toward the drop, with quick catches back.
     lean + (5.0 + 6.0 * severity) * phase.sin()
 }
@@ -875,6 +876,10 @@ fn lit_edge(left: f64) -> f64 {
 /// Notch-shaped outline for `r` (view coords, y up): square top with concave flares,
 /// rounded bottom. Every state uses the same element list so paths interpolate.
 fn notch_path(r: NSRect, radius: f64) -> Retained<CGPath> {
+    notch_bezier(r, radius).CGPath()
+}
+
+fn notch_bezier(r: NSRect, radius: f64) -> Retained<NSBezierPath> {
     let (l, rt) = (r.origin.x, r.origin.x + r.size.width);
     let (b, t) = (r.origin.y, r.origin.y + r.size.height);
     let p = NSBezierPath::new();
@@ -887,7 +892,7 @@ fn notch_path(r: NSRect, radius: f64) -> Retained<CGPath> {
     p.lineToPoint(pt(rt - FLARE, t - FLARE));
     p.curveToPoint_controlPoint1_controlPoint2(pt(rt, t), pt(rt - FLARE, t), pt(rt - FLARE, t));
     p.closePath();
-    p.CGPath()
+    p
 }
 
 /// `r` (screen) expressed in the coordinates of a window whose frame is `win`.
@@ -950,6 +955,20 @@ fn fade(view: &NSView, from: f32, to: f32, delay: f64, duration: f64) {
     view.setAlphaValue(to as f64);
     layer.addAnimation_forKey(&anim, Some(ns_string!("fade")));
     CATransaction::commit();
+}
+
+thread_local!(static CLOCK: Cell<Option<f64>> = const { Cell::new(None) });
+
+/// Animation clock: Core Animation's media time, or a pinned time when rendering
+/// README frames offline.
+fn media_now() -> f64 {
+    CLOCK.with(Cell::get).unwrap_or_else(|| CACurrentMediaTime())
+}
+
+/// Height of the expanded panel for `rows` limit rows.
+fn expanded_height(notch_h: f64, rows: f64) -> f64 {
+    let graph = theme::GRAPH_GAP + theme::OVERLINE_H + theme::GRAPH_H + theme::GRAPH_AXIS_H;
+    notch_h + 10.0 + theme::HEADER_H + theme::OVERLINE_H + rows * theme::ROW_H + graph + theme::BOTTOM_PAD
 }
 
 fn wake_worker() {
@@ -1100,7 +1119,7 @@ fn critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, pose: Pose) {
     let panicking = panic > 0.0;
     // Arms flap in opposite directions while panicking.
     let flap = if panicking && !reduce_motion() {
-        (CACurrentMediaTime() * std::f64::consts::TAU / 0.35).sin() * 1.6 * panic
+        (media_now() * std::f64::consts::TAU / 0.35).sin() * 1.6 * panic
     } else if panicking {
         -1.2
     } else {
@@ -1282,6 +1301,11 @@ fn main() {
     let preview = std::env::args().find_map(|a| a.strip_prefix("--preview-week=").and_then(|v| v.parse().ok()));
     let _ = PREVIEW_WEEK.set(preview);
     let _ = DEMO.set(std::env::args().any(|a| a == "--demo"));
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(dir) = args.iter().position(|a| a == "--render-readme").and_then(|i| args.get(i + 1)) {
+        render::readme_frames(mtm, dir);
+        return;
+    }
     std::thread::spawn(move || usage::run(cfg, rx));
 
     let panel: Retained<NotchPanel> = unsafe {

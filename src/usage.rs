@@ -96,6 +96,15 @@ pub fn snapshot() -> Option<Snapshot> {
     state().clone()
 }
 
+/// Replace the current numbers (used to render README images offline).
+pub fn set_snapshot(s: Snapshot) {
+    *state() = Some(s);
+}
+
+pub fn set_history(samples: Vec<Sample>) {
+    *HISTORY.lock().unwrap_or_else(|e| e.into_inner()) = samples;
+}
+
 pub struct Config {
     pub refresh_secs: u64,
     pub keychain_service: String,

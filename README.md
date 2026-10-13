@@ -2,6 +2,10 @@
 
 A tiny, cute Claude usage meter that lives in your MacBook notch. Native Rust + AppKit/Core Animation (objc2), no webview, ~500 KB binary, ~0% CPU at idle. Hover and it springs open like the Dynamic Island. Requires macOS 14+.
 
+<p align="center"><img src="docs/notch-states.gif" alt="Collapsed notch: Clawd walks, trembles, teeters and falls as the weekly budget drains" width="600"></p>
+
+<p align="center"><img src="docs/notch-expanded.png" alt="Hover panel: remaining bars, reset times and this session's usage graph" width="600"></p>
+
 ## What it shows
 
 - **Collapsed** — all to the left of the notch: Clawd standing on a 7-day weekly bar that drains as you use your weekly budget (when it runs short, he panics and teeters on the edge), then what's **left** of your session and when it resets. Try `--demo` (sweeps the week from 100% to 0% every 40 s) or `--preview-week=15`.
@@ -60,6 +64,15 @@ Multiple accounts: by default the account behind the default Keychain item is sh
 - An expired token is detected from `expiresAt` locally, so no request is sent until Claude Code renews it.
 - Numbers dim when they're stale (error or > 10 min old) and the status line shows their age. When a window's reset time passes it shows as full, and a fetch is scheduled right after each reset. After wake from sleep it refreshes within a few seconds; offline retries every 15 s.
 - Respects Reduce Motion; VoiceOver reads a full summary and "press" refreshes.
+
+## README media
+
+The images above are drawn by the app itself (no screenshots), so they always match the code:
+
+```sh
+./target/release/notchi-usage --render-readme /tmp/notchi-readme
+python3 scripts/make_gifs.py /tmp/notchi-readme docs   # needs Pillow
+```
 
 ## Design
 
