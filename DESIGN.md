@@ -49,7 +49,7 @@ Collapsed pieces share one baseline.
 
 ## Layout
 
-- Collapsed: exactly the notch height, centred on the camera cutout; both ears share the wider ear's width so the blob is symmetric. Left = Clawd · weekly % in a `TRACK`-filled badge (weekly reset lives in the hover panel); right = session % · session reset (`4h42`, tertiary). Content is anchored to the outer edges. Outer inset `9`, inner `5`, reset gap `2.5`, badge gap `4`, badge padding `3.5 × 2.5`. Nothing can be drawn over the camera cutout itself.
+- Collapsed: exactly the notch height, **everything left of the notch** (the blob's right end stops at the middle of the camera cutout, so its corner and flare are hidden by the hardware and only the notch's own curve shows). Order: Clawd standing on the **weekly bar** (7 day-segments `7 × 7`, gap `1.5`, height `3`; lit length = weekly budget left, draining right → left, lit colour = status band) · gap `8` · session % · session reset (`4h42`, tertiary). Outer inset `9`, inner `5`, reset gap `2.5`. Nothing can be drawn over the camera cutout itself.
 - Expanded: `400` wide, `PAD 22` sides, header `46`, overline `18`, rows `26`, bottom `14`, radius `20`.
 - Row columns: name · bar (from `+48`) · % (right edge at `right − 150`) · reset (right-aligned).
 
@@ -58,10 +58,13 @@ Collapsed pieces share one baseline.
 - Hover-in delay 0.12 s, hover-out delay 0.12 s (cancelled if the pointer returns).
 - Dynamic-Island morph: the black blob is a `CAShapeLayer` that springs between the notch-sized and panel-sized outline (open: stiffness 300 / damping 27, a hint of bounce; close: 420 / 37, near-critical). Content fades in 0.1 s after the blob starts opening and fades out first when closing. Mid-flight reversals start from the on-screen shape. Reduce Motion → instant swap + crossfade.
 - No shadow, ever — like the hardware notch and Dynamic Island, it's pure black.
-- Collapsed bottom radius ≈ 0.28 × notch height (matches the hardware cutout); expanded radius 22.
+- Collapsed corners copy the hardware notch: bottom radius `14` (capped at 0.45 × notch height), top flare `6`. The right end hides inside the cutout, so the left end is the only drawn corner and it mirrors the hardware's right side. Expanded radius 22.
 - Click = refresh (shows "Refreshing…"), right/ctrl-click = menu (Refresh Now, Open Usage Page, Quit).
 - Stale data (error or > 10 min) renders numbers in `TEXT_TERTIARY`.
 
 ## Clawd
+
+In the collapsed notch Clawd stands on the weekly bar. While the lit platform is long he stays centred; as the edge reaches his feet **panic** rises (0 → 1), and once it reaches his middle he's pushed along with it, balancing with his centre right on the edge. Panicking Clawd leans over the drop (pivot = platform edge) by `panic × (9° + 9° × severity)` with a quick wobble (`± 5–11°`, period `1.1 → 0.65 s` as the week drains), shows wide eyes glancing at the drop, an open "o" mouth, two sweat drops and arms flapping in opposite directions. Severity = `1 − left/60` (min 0.3). The redraw timer (12 fps, Clawd's area only) runs only while he's teetering and collapsed; Reduce Motion freezes him at a static lean.
+
 
 Drawn from the official Claude Code icon path (24×24 viewBox) as nine rectangles. Moods by the tightest remaining limit: `> 50%` happy, `> 30%` busy, `> 10%` sweating, `≤ 10%` dizzy (squint + sweat), no data = asleep (closed eyes + "z"). Blinks at a random 2.5–6 s interval. Rect edges are snapped to device pixels so the pixel art stays crisp.

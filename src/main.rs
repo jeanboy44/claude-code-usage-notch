@@ -1,7 +1,7 @@
 mod theme;
 mod usage;
 
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::ptr::NonNull;
 use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
@@ -12,14 +12,15 @@ use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSAccessibilityButtonRole, NSApplication, NSAutoresizingMaskOptions, NSApplicationActivationPolicy,
-    NSApplicationDidChangeScreenParametersNotification, NSBackingStoreType, NSBezierPath, NSColor,
+    NSAffineTransformNSAppKitAdditions, NSApplicationDidChangeScreenParametersNotification,
+    NSBackingStoreType, NSBezierPath, NSColor, NSGraphicsContext,
     NSEvent, NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSMainMenuWindowLevel,
     NSMenu, NSMenuItem, NSPanel, NSScreen, NSStringDrawing, NSTrackingArea, NSTrackingAreaOptions,
     NSView, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
     NSWorkspaceDidWakeNotification,
 };
 use objc2_foundation::{
-    ns_string, MainThreadMarker, NSDate, NSDateFormatter, NSDictionary, NSLocale, NSNotification,
+    ns_string, MainThreadMarker, NSAffineTransform, NSDate, NSDateFormatter, NSDictionary, NSLocale, NSNotification,
     NSNotificationCenter, NSNumber, NSPoint, NSRect, NSSize, NSString, NSTimeZone, NSTimer, NSURL,
 };
 use objc2_core_graphics::CGPath;
@@ -36,6 +37,8 @@ const HOVER_IN_DELAY: f64 = 0.12;
 const HOVER_OUT_DELAY: f64 = 0.12;
 
 static WAKE: OnceLock<Sender<()>> = OnceLock::new();
+/// `--preview-week=N` pins the weekly % left, to see Clawd's teeter without burning budget.
+static PREVIEW_WEEK: OnceLock<Option<f64>> = OnceLock::new();
 
 #[derive(Default)]
 struct Ivars {
@@ -55,6 +58,8 @@ struct Ivars {
     anim_gen: Cell<u64>,
     /// The black blob behind the content (lives on a sibling background view).
     shape: OnceCell<Retained<CAShapeLayer>>,
+    /// Redraw timer while Clawd teeters on the edge of the weekly bar.
+    teeter: RefCell<Option<Retained<NSTimer>>>,
 }
 
 // A panel that can never take keyboard focus or become main — the notch must not
@@ -97,8 +102,8 @@ define_class!(
         }
 
         #[unsafe(method(drawRect:))]
-        fn draw_rect(&self, _dirty: NSRect) {
-            self.draw();
+        fn draw_rect(&self, dirty: NSRect) {
+            self.draw(dirty);
         }
 
         #[unsafe(method(mouseEntered:))]
@@ -211,7 +216,10 @@ impl NotchView {
         self.ivars().notch_h.set(g.notch_h);
         let snap = snapshot();
         // Collapsed ears hug their own content, so the two sides may differ in width.
-        let (lw, rw) = Ears::new(snap.as_ref(), g.notch_h, false).widths();
+        let (lw, _) = Ears::new(snap.as_ref(), g.notch_h, false).widths();
+        // Nothing on the right: end the blob inside the camera cutout so our corner and
+        // flare hide behind the hardware and only the notch's own curve shows.
+        let rw = -(g.notch_w / 2.0);
         let rows = snap.map_or(2, |s| rows(&s).len().max(1)) as f64;
         let content = theme::HEADER_H + theme::OVERLINE_H + rows * theme::ROW_H + theme::BOTTOM_PAD;
         let (cw, ew) = (lw + g.notch_w + rw + 2.0 * FLARE, (g.notch_w + 2.0 * FLARE + 2.0 * lw.max(rw)).max(EXPANDED_W));
@@ -226,7 +234,7 @@ impl NotchView {
         if expanded {
             theme::RADIUS_EXPANDED
         } else {
-            (self.ivars().notch_h.get() * theme::RADIUS_COLLAPSED_RATIO).min(10.0)
+            theme::RADIUS_COLLAPSED.min(self.ivars().notch_h.get() * theme::RADIUS_COLLAPSED_MAX_RATIO)
         }
     }
 
@@ -264,6 +272,7 @@ impl NotchView {
 
         if on {
             iv.shown_expanded.set(true);
+            self.update_teeter();
             self.setNeedsDisplay(true);
             fade(self, 0.0, 1.0, 0.1, 0.22);
         } else {
@@ -304,6 +313,33 @@ impl NotchView {
         CATransaction::commit();
         iv.shown_expanded.set(on);
         self.setNeedsDisplay(true);
+        self.update_teeter();
+    }
+
+    /// Run a light redraw timer only while Clawd is actually teetering.
+    fn update_teeter(&self) {
+        let iv = self.ivars();
+        let overhang = || {
+            let ears = Ears::new(snapshot().as_ref(), iv.notch_h.get(), false);
+            perch(0.0, ears.week_left, ears.sprite).2
+        };
+        let need = !iv.shown_expanded.get() && !reduce_motion() && overhang() > 0.0;
+        let mut timer = iv.teeter.borrow_mut();
+        if need && timer.is_none() {
+            let view = self.retain();
+            // Only Clawd's area is invalidated, so the session text isn't re-laid out each frame.
+            let block = RcBlock::new(move |_: NonNull<NSTimer>| {
+                let h = view.bounds().size.height;
+                view.setNeedsDisplayInRect(NSRect::new(pt(0.0, 0.0), NSSize::new(session_text_x(), h)));
+            });
+            let t = unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.0 / 12.0, true, &block) };
+            t.setTolerance(0.01);
+            *timer = Some(t);
+        } else if !need {
+            if let Some(t) = timer.take() {
+                t.invalidate();
+            }
+        }
     }
 
     /// Fires every few seconds (randomised): blink and pick up new data.
@@ -344,7 +380,7 @@ impl NotchView {
         }
     }
 
-    fn draw(&self) {
+    fn draw(&self, dirty: NSRect) {
         let b = self.bounds();
         let w = b.size.width;
         let iv = self.ivars();
@@ -361,36 +397,45 @@ impl NotchView {
             let baseline = notch_h / 2.0 + ears.session_ty.size * 0.36;
             let top = |ty: &Type| baseline - ty.size * 0.97;
 
-            let [session, week] = &ears.sides;
+            let session = &ears.session;
 
-            // Left ear: Clawd · [weekly left], anchored to the outer edge.
-            let mut x = FLARE + theme::EAR_OUTER;
-            critter(x + ears.sprite / 2.0, notch_h / 2.0, ears.sprite, scale, mood, iv.blink.get());
-            x += ears.sprite + theme::BADGE_GAP;
-            let bw = measure(&week.value, &ears.week_ty) + 2.0 * theme::BADGE_PAD_X;
-            let bh = ears.week_ty.size + 2.0 * theme::BADGE_PAD_Y;
-            theme::TRACK.ns().set();
-            let br = (bh / 2.0).min(4.0);
-            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-                NSRect::new(pt(x, (notch_h - bh) / 2.0), NSSize::new(bw, bh)),
-                br,
-                br,
-            )
-            .fill();
-            text(&week.value, x + theme::BADGE_PAD_X, top(&ears.week_ty), &ears.week_ty, week.color, Align::Left);
-
-            // Right ear: session left · session reset, anchored to the outer edge.
-            let mut x = w - FLARE - theme::EAR_OUTER;
-            if let Some(r) = &session.reset {
-                x -= text(r, x, top(&ears.reset_ty), &ears.reset_ty, theme::TEXT_TERTIARY, Align::Right) + theme::RESET_GAP;
+            // Left ear: Clawd standing on the weekly bar (7 day-segments, lit = weekly left).
+            let sprite = ears.sprite;
+            let clawd_h = sprite * 15.0 / 24.0;
+            let y_top = (notch_h - clawd_h - theme::WEEK_BAR_H) / 2.0;
+            let bar_y = y_top + clawd_h;
+            let bar_x = FLARE + theme::EAR_OUTER;
+            week_bar(bar_x, bar_y, ears.week_left, ears.week_color);
+            let (cx, edge, panic) = perch(bar_x, ears.week_left, sprite);
+            let tilt = teeter_degrees(panic, ears.week_left);
+            NSGraphicsContext::saveGraphicsState_class();
+            if tilt != 0.0 {
+                // Pivot on the platform edge, like tipping over it.
+                let t = NSAffineTransform::transform();
+                t.translateXBy_yBy(edge, bar_y);
+                t.rotateByDegrees(tilt);
+                t.translateXBy_yBy(-edge, -bar_y);
+                t.concat();
             }
-            text(&session.value, x, top(&ears.session_ty), &ears.session_ty, session.color, Align::Right);
+            critter(cx, y_top + clawd_h / 2.0, sprite, scale, mood, iv.blink.get() && panic == 0.0, panic);
+            NSGraphicsContext::restoreGraphicsState_class();
+
+            // Then session left · session reset, still left of the notch.
+            let x = session_text_x();
+            if dirty.origin.x + dirty.size.width <= x {
+                return; // teeter frame: only Clawd needs repainting
+            }
+            let x = x + text(&session.value, x, top(&ears.session_ty), &ears.session_ty, session.color, Align::Left);
+            if let Some(r) = &session.reset {
+                text(r, x + theme::RESET_GAP, top(&ears.reset_ty), &ears.reset_ty, theme::TEXT_TERTIARY, Align::Left);
+            }
+            let _ = w;
             return;
         }
 
         // Header: Clawd + mood line + status line.
         let top = notch_h + 10.0;
-        critter(FLARE + PAD + 18.0, top + 18.0, 36.0, scale, mood, iv.blink.get());
+        critter(FLARE + PAD + 18.0, top + 18.0, 36.0, scale, mood, iv.blink.get(), 0.0);
         let x = FLARE + PAD + 48.0;
         text(mood.title(), x, top + 4.0, &theme::TITLE, theme::TEXT_PRIMARY, Align::Left);
         let status = match snap.as_ref() {
@@ -434,14 +479,15 @@ impl NotchView {
     }
 }
 
-/// What the collapsed ears show: `[session, weekly]` → "Clawd [63%] | notch | 94% 4h42".
+/// What the collapsed ears show: "Clawd on the weekly bar | notch | 94% 4h42".
 struct Ears {
-    sides: [Side; 2],
+    session: Side,
+    /// Weekly % left (100 when unknown) and the colour its lit segments use.
+    week_left: f64,
+    week_color: Color,
     /// Session % — the hero number.
     session_ty: Type,
     reset_ty: Type,
-    /// Weekly % in the badge — lighter, secondary.
-    week_ty: Type,
     sprite: f64,
 }
 
@@ -454,7 +500,8 @@ struct Side {
 impl Ears {
     fn new(snap: Option<&Snapshot>, notch_h: f64, stale: bool) -> Self {
         let size = (notch_h / 2.9).clamp(9.5, theme::MICRO.size);
-        let side = |l: Option<Limit>| match l {
+        let (five, week) = snap.map_or((None, None), |s| (s.five_hour, s.seven_day));
+        let session = match five {
             Some(l) => Side {
                 value: pct(l.left()),
                 color: if stale { theme::TEXT_TERTIARY } else { theme::remaining(l.left()) },
@@ -462,27 +509,86 @@ impl Ears {
             },
             None => Side { value: "–".to_string(), color: theme::TEXT_TERTIARY, reset: None },
         };
-        let (five, week) = snap.map_or((None, None), |s| (s.five_hour, s.seven_day));
+        let week = match PREVIEW_WEEK.get().copied().flatten() {
+            Some(left) => Some(Limit { used: 100.0 - left, resets_at: None }),
+            None => week,
+        };
+        let (week_left, week_color) = match week {
+            Some(l) if !stale => (l.left(), theme::remaining(l.left())),
+            Some(l) => (l.left(), theme::TEXT_TERTIARY),
+            None => (100.0, theme::TRACK),
+        };
         Ears {
-            sides: [side(five), side(week)],
+            session,
+            week_left,
+            week_color,
             session_ty: Type { size: (size + 1.5).min(notch_h * 0.45), ..theme::MICRO_HERO },
             reset_ty: Type { size: size - 1.5, ..theme::MICRO_LABEL },
-            week_ty: Type { size: size - 0.5, ..theme::MICRO_SECONDARY },
-            sprite: ((notch_h - 14.0) * 24.0 / 15.0).clamp(16.0, 24.0),
+            sprite: ((notch_h - theme::WEEK_BAR_H - 12.0) * 24.0 / 15.0).clamp(16.0, 22.0),
         }
     }
 
     /// Content widths of the (left, right) ears, excluding the flares.
-    /// Both ears get the wider one's width so the blob stays centred on the notch.
+    /// Everything lives left of the notch; the right side ends at the cutout.
     fn widths(&self) -> (f64, f64) {
-        let [session, week] = &self.sides;
-        let pad = theme::EAR_OUTER + theme::EAR_INNER;
-        let left = self.sprite + theme::BADGE_GAP + measure(&week.value, &self.week_ty) + 2.0 * theme::BADGE_PAD_X;
-        let right = measure(&session.value, &self.session_ty)
-            + session.reset.as_ref().map_or(0.0, |r| theme::RESET_GAP + measure(r, &self.reset_ty));
-        let ear = pad + left.max(right);
-        (ear, ear)
+        let session = measure(&self.session.value, &self.session_ty)
+            + self.session.reset.as_ref().map_or(0.0, |r| theme::RESET_GAP + measure(r, &self.reset_ty));
+        (session_text_x() - FLARE + session + theme::EAR_INNER, 0.0)
     }
+}
+
+/// Where the session text starts in the collapsed panel (after Clawd's bar).
+fn session_text_x() -> f64 {
+    FLARE + theme::EAR_OUTER + theme::week_bar_w() + theme::SESSION_GAP
+}
+
+/// Seven day-segments; the lit length is the weekly budget left, draining right → left.
+fn week_bar(x: f64, y: f64, left: f64, color: Color) {
+    let units = 7.0 * left.clamp(0.0, 100.0) / 100.0;
+    let (seg, gap, h) = (theme::WEEK_SEG_W, theme::WEEK_SEG_GAP, theme::WEEK_BAR_H);
+    for i in 0..7 {
+        let sx = x + i as f64 * (seg + gap);
+        let seg_rect = |w: f64| NSRect::new(pt(sx, y), NSSize::new(w, h));
+        theme::TRACK.ns().set();
+        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(seg_rect(seg), 1.0, 1.0).fill();
+        let lit = (units - i as f64).clamp(0.0, 1.0);
+        if lit > 0.0 {
+            color.ns().set();
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(seg_rect(seg * lit), 1.0, 1.0).fill();
+        }
+    }
+}
+
+/// Where Clawd stands on the weekly bar starting at `bar_x`: (centre x, platform
+/// edge x, panic 0..1). Clawd stays centred while the platform is long enough; as the
+/// edge reaches his feet panic rises, and once it reaches his middle he's pushed along
+/// with it, balancing with his centre right on the edge.
+fn perch(bar_x: f64, left: f64, sprite: f64) -> (f64, f64, f64) {
+    let (seg, gap) = (theme::WEEK_SEG_W, theme::WEEK_SEG_GAP);
+    let units = 7.0 * left.clamp(0.0, 100.0) / 100.0;
+    let full = units.floor();
+    let edge = if units >= 7.0 { bar_x + theme::week_bar_w() } else { bar_x + full * (seg + gap) + (units - full) * seg };
+    let home = bar_x + theme::week_bar_w() / 2.0;
+    let cx = home.min(edge).max(bar_x);
+    let right_foot = cx + sprite * 0.32;
+    let panic = ((right_foot - edge) / (sprite * 0.32)).clamp(0.0, 1.0);
+    (cx, edge, panic)
+}
+
+/// Lean over the drop and wobble — harder and faster the less weekly budget is left.
+fn teeter_degrees(panic: f64, left: f64) -> f64 {
+    if panic <= 0.0 {
+        return 0.0;
+    }
+    let severity = (1.0 - left / 60.0).clamp(0.3, 1.0);
+    let lean = panic * (9.0 + 9.0 * severity);
+    if reduce_motion() {
+        return lean;
+    }
+    let period = 1.1 - 0.45 * severity;
+    let phase = CACurrentMediaTime() * std::f64::consts::TAU / period;
+    // Mostly leaning toward the drop, with quick catches back.
+    lean + panic * (5.0 + 6.0 * severity) * phase.sin()
 }
 
 /// Notch-shaped outline for `r` (view coords, y up): square top with concave flares,
@@ -689,7 +795,8 @@ impl Mood {
 /// Clawd, drawn from the official Claude Code icon (24×24 viewBox, body spans y 5..20).
 /// `s` is the sprite width; the sprite is 24×15 units, centred on (cx, cy).
 /// Edges are snapped to device pixels so the pixel art stays crisp.
-fn critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, blink: bool) {
+/// `panic` (0..1) swaps in a startled face and flailing arms.
+fn critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, blink: bool, panic: f64) {
     let u = s / 24.0;
     let (x0, y0) = (cx - 12.0 * u, cy - 7.5 * u);
     let snap = |v: f64| (v * scale).round() / scale;
@@ -698,33 +805,55 @@ fn critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, blink: bool) {
         let (r, b) = (snap(x0 + (x + w) * u), snap(y0 + (y - 5.0 + h) * u));
         NSBezierPath::fillRect(NSRect::new(pt(l, t), NSSize::new(r - l, b - t)));
     };
+    let panicking = panic > 0.0;
+    // Arms flap in opposite directions while panicking.
+    let flap = if panicking && !reduce_motion() {
+        (CACurrentMediaTime() * std::f64::consts::TAU / 0.35).sin() * 1.6 * panic
+    } else if panicking {
+        -1.2
+    } else {
+        0.0
+    };
 
     theme::CLAWD.ns().set();
     rect(3.0, 5.0, 18.0, 12.08); // body
-    rect(0.0, 10.95, 24.0, 3.1); // arms
+    rect(0.0, 10.95 - flap, 3.0, 3.1); // left arm
+    rect(21.0, 10.95 + flap, 3.0, 3.1); // right arm
     for lx in [4.487, 7.488, 15.0, 18.0] {
         rect(lx, 17.0, 1.51, 3.0); // legs
     }
 
     // Eyes are holes in the icon; paint them with the notch black.
     theme::CLAWD_EYE.ns().set();
-    let (eye_top, eye_h) = match mood {
-        Mood::Sleepy => (10.1, 0.85),
-        Mood::Dizzy => (9.1, 0.9),
-        _ if blink => (10.1, 0.85),
-        _ => (8.1, 2.85),
-    };
-    for ex in [6.0, 16.51] {
-        rect(ex, eye_top, 1.49, eye_h);
+    if panicking {
+        // Wide eyes glancing down at the drop, mouth open in an "o".
+        for ex in [6.6, 17.0] {
+            rect(ex, 7.6, 1.9, 3.6);
+        }
+        rect(10.6, 14.2, 2.8, 1.9);
+    } else {
+        let (eye_top, eye_h) = match mood {
+            Mood::Sleepy => (10.1, 0.85),
+            Mood::Dizzy => (9.1, 0.9),
+            _ if blink => (10.1, 0.85),
+            _ => (8.1, 2.85),
+        };
+        for ex in [6.0, 16.51] {
+            rect(ex, eye_top, 1.49, eye_h);
+        }
     }
 
-    if matches!(mood, Mood::Careful | Mood::Dizzy) {
-        // sweat drop
+    if panicking || matches!(mood, Mood::Careful | Mood::Dizzy) {
+        // sweat drops (two when panicking)
         theme::SWEAT.ns().set();
         rect(22.0, 5.5, 1.3, 1.3);
         rect(22.6, 4.6, 0.7, 0.9);
+        if panicking {
+            rect(1.0, 6.5, 1.3, 1.3);
+            rect(1.3, 5.6, 0.7, 0.9);
+        }
     }
-    if mood == Mood::Sleepy {
+    if mood == Mood::Sleepy && !panicking {
         let ty = Type { size: (8.0 * u).max(7.0), ..theme::NUMERAL };
         text("z", x0 + 22.5 * u, y0 - 6.0 * u, &ty, theme::TEXT_SECONDARY, Align::Left);
     }
@@ -840,6 +969,8 @@ fn main() {
     let (tx, rx) = mpsc::channel();
     let _ = WAKE.set(tx);
     let cfg = usage::Config::load();
+    let preview = std::env::args().find_map(|a| a.strip_prefix("--preview-week=").and_then(|v| v.parse().ok()));
+    let _ = PREVIEW_WEEK.set(preview);
     std::thread::spawn(move || usage::run(cfg, rx));
 
     let panel: Retained<NotchPanel> = unsafe {
@@ -912,4 +1043,26 @@ fn main() {
 
     schedule_tick(view.clone());
     app.run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clawd_stays_centred_while_the_platform_is_long() {
+        let (cx, edge, panic) = perch(0.0, 100.0, 20.0);
+        assert_eq!(cx, theme::week_bar_w() / 2.0);
+        assert_eq!(edge, theme::week_bar_w());
+        assert_eq!(panic, 0.0);
+        assert_eq!(perch(0.0, 80.0, 20.0).2, 0.0);
+    }
+
+    #[test]
+    fn clawd_hangs_off_as_the_week_drains() {
+        let (cx, edge, low) = perch(0.0, 20.0, 20.0);
+        assert_eq!(cx, edge); // balancing right on the edge
+        assert_eq!(low, 1.0);
+        assert!(teeter_degrees(1.0, 5.0).abs() > 0.0);
+    }
 }

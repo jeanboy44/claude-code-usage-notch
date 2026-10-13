@@ -9,7 +9,7 @@ objc2 = "0.6"
 block2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std", "block2", "NSArray", "NSDate", "NSDateFormatter", "NSDictionary", "NSEnumerator",
-    "NSFormatter", "NSGeometry", "NSLocale", "NSNotification", "NSObject", "NSOperation", "NSString",
+    "NSFormatter", "NSGeometry", "NSLocale", "NSNotification", "NSObject", "NSOperation", "NSAffineTransform", "NSString",
     "NSTimeZone", "NSTimer", "NSURL", "NSValue",
 ] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
@@ -17,7 +17,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSAccessibilityProtocols", "NSApplication", "NSAttributedString", "NSBezierPath", "NSColor",
     "NSEvent", "NSFont", "NSFontDescriptor", "NSGraphics", "NSMenu", "NSMenuItem", "NSPanel", "NSResponder",
     "NSRunningApplication", "NSScreen", "NSStringDrawing", "NSTrackingArea", "NSView", "NSWindow",
-    "NSWorkspace", "NSAnimation", "objc2-quartz-core", "objc2-core-graphics",
+    "NSWorkspace", "NSAnimation", "NSAffineTransform", "NSGraphicsContext", "objc2-quartz-core", "objc2-core-graphics",
 ] }
 objc2-quartz-core = { version = "0.3", default-features = false, features = [
     "std", "objc2-core-foundation", "objc2-core-graphics", "CALayer", "CAShapeLayer",

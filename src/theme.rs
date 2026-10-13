@@ -78,8 +78,6 @@ pub const OVERLINE: Type = Type { size: 9.5, weight: medium, mono: false };
 pub const MICRO: Type = Type { size: 11.0, weight: medium, mono: true };
 /// Collapsed session % (base size + 1.5).
 pub const MICRO_HERO: Type = Type { size: 12.5, weight: medium, mono: true };
-/// Collapsed weekly % in its badge — thinner than the hero.
-pub const MICRO_SECONDARY: Type = Type { size: 10.5, weight: regular, mono: true };
 pub const MICRO_LABEL: Type = Type { size: 9.5, weight: regular, mono: false };
 
 // ---- spacing / shape ----
@@ -87,15 +85,22 @@ pub const MICRO_LABEL: Type = Type { size: 9.5, weight: regular, mono: false };
 pub const EAR_OUTER: f64 = 9.0; // content inset from the outer edge
 pub const EAR_INNER: f64 = 5.0; // breathing room next to the camera cutout
 pub const RESET_GAP: f64 = 2.5; // session % ↔ its reset countdown
-pub const BADGE_GAP: f64 = 4.0; // session group ↔ weekly badge
-pub const BADGE_PAD_X: f64 = 3.5; // weekly badge padding (fill = TRACK)
-pub const BADGE_PAD_Y: f64 = 2.5;
+// weekly bar under Clawd: 7 day-segments, lit = weekly budget left
+pub const WEEK_SEG_W: f64 = 7.0;
+pub const WEEK_SEG_GAP: f64 = 1.5;
+pub const WEEK_BAR_H: f64 = 3.0;
+pub const SESSION_GAP: f64 = 8.0; // weekly bar ↔ session %
+pub const fn week_bar_w() -> f64 {
+    7.0 * WEEK_SEG_W + 6.0 * WEEK_SEG_GAP
+}
 pub const FLARE: f64 = 6.0; // concave top corners melting into the bezel
 pub const EXPANDED_W: f64 = 400.0;
 pub const PAD: f64 = 22.0;
 pub const RADIUS_EXPANDED: f64 = 22.0;
-/// Collapsed bottom radius as a fraction of notch height (≈ the hardware notch).
-pub const RADIUS_COLLAPSED_RATIO: f64 = 0.28;
+/// Collapsed bottom radius, matched to the hardware notch's own bottom corner
+/// (capped to a fraction of the notch height for unusually short menu bars).
+pub const RADIUS_COLLAPSED: f64 = 14.0;
+pub const RADIUS_COLLAPSED_MAX_RATIO: f64 = 0.45;
 /// (stiffness, damping) at mass 1. Open ≈ ζ 0.78 (soft bounce), close ≈ ζ 0.9.
 pub const SPRING_OPEN: (f64, f64) = (300.0, 27.0);
 pub const SPRING_CLOSE: (f64, f64) = (420.0, 37.0);
