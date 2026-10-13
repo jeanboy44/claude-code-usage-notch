@@ -1,6 +1,6 @@
 [package]
 name = "notchi-usage"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A tiny, cute Claude usage meter living in the MacBook notch"
 
