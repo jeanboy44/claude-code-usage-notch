@@ -823,7 +823,7 @@ fn week_bar(x: f64, y: f64, left: f64, color: Color) {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Stance {
-    /// Green/blue: standing calmly in the middle of what's left.
+    /// Green: standing calmly in the middle of what's left.
     Calm,
     /// Yellow: still in the middle, shivering now and then.
     Tremble,

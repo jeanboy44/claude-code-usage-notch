@@ -6,7 +6,7 @@ Single source of truth: `src/theme.rs`. The view never uses a raw colour or size
 
 1. **Melt into the notch.** The surface is pure `#000000`, the top edge is square with small concave flares, so the panel reads as part of the hardware.
 2. **Show what's left.** Every number and bar is *remaining* budget. Bars shrink as you use Claude, so bar length always matches the number next to it.
-3. **One brand accent.** Claude clay is the brand colour (Clawd); numbers and bars use the four status bands.
+3. **One brand accent.** Claude clay is the brand colour (Clawd); numbers and bars use the three status bands.
 4. **Sharp, quiet type.** SF Pro at regular/medium weights, tabular digits for every number.
 
 ## Colour
@@ -21,12 +21,11 @@ Single source of truth: `src/theme.rs`. The view never uses a raw colour or size
 | `CLAWD` | Claude clay `#D97757` | mascot |
 | `SWEAT` | Dusty blue `#6A9BCC` | Clawd's sweat drop |
 
-Status colour, by **remaining** % (four vivid bands, kept slightly warm to sit next to Claude clay):
+Status colour, by **remaining** % (three vivid bands, kept slightly warm to sit next to Claude clay):
 
 | Remaining | Colour |
 |---|---|
-| 90–100% | Blue `#4EA8F5` |
-| 50–90% | Green `#6FCB63` |
+| 50–100% | Green `#6FCB63` |
 | 20–50% | Yellow `#F7C33C` |
 | 0–20% | Red `#F2573F` |
 
@@ -72,7 +71,7 @@ In the collapsed notch Clawd stands on the weekly bar (sprite ≤ 22 pt, bar und
 
 | Weekly left | Band | Behaviour |
 |---|---|---|
-| ≥ 50% | blue / green | Walks to the middle of the segments still lit and stands calmly |
+| ≥ 50% | green | Walks to the middle of the segments still lit and stands calmly |
 | 20–50% | yellow | Walks to the middle, then trembles there (±1.6°, ±0.5 pt, 13 Hz for 0.9 s every tick) with a sweat drop |
 | < 20% | red | Walks to the very edge of what's left and **teeters**: leaning over the drop by `9° + 9° × severity` with a `± 5–11°` wobble (period `1.1 → 0.65 s`), wide eyes, open mouth, two sweat drops, flapping arms. Severity = `1 − left/20` (min 0.3) |
 | 0% | — | **Falls**: drops out of sight (0.25 s), a beat later pops back up so only his head peeks above the bottom edge |

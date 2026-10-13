@@ -25,9 +25,8 @@ const BLACK: Color = Color::hex(0x000000); // must stay pure black to blend with
 const IVORY: Color = Color::hex(0xFAF9F5);
 const CLOUD: Color = Color::hex(0xB0AEA5);
 const CLAUDE_ORANGE: Color = Color::hex(0xD97757); // Clawd
-// Status bands: vivid takes on Anthropic's blue / green plus warm yellow and red,
-// all kept slightly warm so they sit next to Claude clay without clashing.
-const BLUE: Color = Color::hex(0x4EA8F5);
+// Status bands: vivid green plus warm yellow and red, all kept slightly warm so they
+// sit next to Claude clay without clashing.
 const GREEN: Color = Color::hex(0x6FCB63);
 const YELLOW: Color = Color::hex(0xF7C33C);
 const RED: Color = Color::hex(0xF2573F);
@@ -44,7 +43,6 @@ pub const CLAWD_EYE: Color = BLACK;
 pub const SWEAT: Color = DUSTY_BLUE;
 
 /// Band floors (% left) shared by colours and Clawd's stance.
-pub const BAND_BLUE: f64 = 90.0;
 pub const BAND_GREEN: f64 = 50.0;
 pub const BAND_YELLOW: f64 = 20.0;
 /// Seconds Clawd shivers per tick in the yellow band.
@@ -58,7 +56,6 @@ pub const GONE_ANIM: f64 = 1.25;
 /// Status by **remaining** percentage: bar fill, % numerals and the collapsed readout.
 pub fn remaining(left: f64) -> Color {
     match left {
-        l if l >= BAND_BLUE => BLUE,     // fresh
         l if l >= BAND_GREEN => GREEN,   // comfortable
         l if l >= BAND_YELLOW => YELLOW, // getting low
         _ => RED,                 // nearly out
