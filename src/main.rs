@@ -12,35 +12,37 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSAccessibilityButtonRole, NSApplication, NSAutoresizingMaskOptions, NSControlStateValueOff,
-    NSControlStateValueOn, NSApplicationActivationPolicy,
-    NSAffineTransformNSAppKitAdditions, NSApplicationDidChangeScreenParametersNotification,
-    NSBackingStoreType, NSBezierPath, NSColor, NSGraphicsContext,
-    NSEvent, NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSMainMenuWindowLevel,
-    NSMenu, NSMenuItem, NSPanel, NSScreen, NSStringDrawing, NSTrackingArea, NSTrackingAreaOptions,
-    NSView, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
-    NSWorkspaceDidWakeNotification,
-};
-use objc2_foundation::{
-    ns_string, MainThreadMarker, NSAffineTransform, NSDate, NSDateFormatter, NSDictionary, NSLocale, NSNotification,
-    NSNotificationCenter, NSNumber, NSPoint, NSRect, NSSize, NSString, NSTimeZone, NSTimer, NSURL,
+    NSAccessibilityButtonRole, NSApplication, NSApplicationActivationPolicy,
+    NSApplicationDidChangeScreenParametersNotification, NSAffineTransformNSAppKitAdditions,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSBezierPath, NSColor, NSControlStateValueOff,
+    NSControlStateValueOn, NSEvent, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
+    NSGraphicsContext, NSMainMenuWindowLevel, NSMenu, NSMenuItem, NSPanel, NSScreen,
+    NSStringDrawing, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindowCollectionBehavior,
+    NSWindowStyleMask, NSWorkspace, NSWorkspaceDidWakeNotification,
 };
 use objc2_core_graphics::CGPath;
-use objc2_service_management::{SMAppService, SMAppServiceStatus};
+use objc2_foundation::{
+    ns_string, MainThreadMarker, NSAffineTransform, NSDate, NSDateFormatter, NSDictionary,
+    NSLocale, NSNotification, NSNotificationCenter, NSNumber, NSPoint, NSRect, NSSize, NSString,
+    NSTimeZone, NSTimer, NSURL,
+};
 use objc2_quartz_core::{
     kCAFillModeBoth, kCAMediaTimingFunctionEaseOut, CABasicAnimation, CACurrentMediaTime,
     CAMediaTiming, CAMediaTimingFunction, CAShapeLayer, CASpringAnimation, CATransaction,
 };
+use objc2_service_management::{SMAppService, SMAppServiceStatus};
 
 use theme::{Color, Type, EXPANDED_W, FLARE, PAD};
-use usage::{snapshot, Limit, Snapshot};
+use usage::{
+    history_for, save_provider_config, snapshot_for, Limit, Provider, Sample, Snapshot,
+};
 
-const USAGE_PAGE: &str = "https://claude.ai/settings/usage";
 const HOVER_IN_DELAY: f64 = 0.12;
 const HOVER_OUT_DELAY: f64 = 0.12;
+const PROVIDER_GAP: f64 = 14.0;
 
 static WAKE: OnceLock<Sender<()>> = OnceLock::new();
-/// `--preview-week=N` pins the weekly % left, to see Clawd's teeter without burning budget.
+/// `--preview-week=N` pins the weekly % left, to see characters' teeter without burning budget.
 static PREVIEW_WEEK: OnceLock<Option<f64>> = OnceLock::new();
 /// `--demo` sweeps the weekly % left from 100 to 0 every 40 s (walk, tremble, teeter).
 static DEMO: OnceLock<bool> = OnceLock::new();
@@ -56,7 +58,12 @@ struct Walk {
 
 impl Default for Walk {
     fn default() -> Self {
-        Walk { from: f64::NAN, to: f64::NAN, start: 0.0, duration: 0.0 }
+        Walk {
+            from: f64::NAN,
+            to: f64::NAN,
+            start: 0.0,
+            duration: 0.0,
+        }
     }
 }
 
@@ -73,7 +80,23 @@ impl Walk {
 }
 
 #[derive(Default)]
+struct CharacterState {
+    /// End of the current tremble burst (CACurrentMediaTime), in the yellow band.
+    tremble_until: Cell<f64>,
+    /// Walk along the weekly bar, as offsets from the bar's left end.
+    walk: Cell<Walk>,
+    /// Fell off at 0%: when let go (then pops back up, head only).
+    gone: Cell<bool>,
+    gone_start: Cell<f64>,
+}
+
+#[derive(Default)]
 struct Ivars {
+    show_claude: Cell<bool>,
+    show_antigravity: Cell<bool>,
+    claude_char: CharacterState,
+    antigravity_char: CharacterState,
+
     expanded: Cell<bool>,
     /// Pointer currently inside the panel (expansion waits for it to linger).
     hovering: Cell<bool>,
@@ -82,23 +105,15 @@ struct Ivars {
     refreshing: Cell<bool>,
     seen_version: Cell<u64>,
     notch_h: Cell<f64>,
-    /// Layout the content is drawn in. Lags `expanded` while collapsing, so the
-    /// expanded content can fade out before the collapsed content appears.
+    /// Layout the content is drawn in. Lags `expanded` while collapsing.
     shown_expanded: Cell<bool>,
     /// A morph is in flight; idle relayouts must not fight it.
     animating: Cell<bool>,
     anim_gen: Cell<u64>,
     /// The black blob behind the content (lives on a sibling background view).
     shape: OnceCell<Retained<CAShapeLayer>>,
-    /// Redraw timer while Clawd trembles or teeters on the weekly bar.
+    /// Redraw timer while characters tremble or teeter on the weekly bar.
     teeter: RefCell<Option<Retained<NSTimer>>>,
-    /// End of the current tremble burst (CACurrentMediaTime), in the yellow band.
-    tremble_until: Cell<f64>,
-    /// Clawd's walk along the weekly bar, as offsets from the bar's left end.
-    walk: Cell<Walk>,
-    /// Fell off at 0%: when he let go (then he pops back up, head only).
-    gone: Cell<bool>,
-    gone_start: Cell<f64>,
 }
 
 // A panel that can never take keyboard focus or become main — the notch must not
@@ -177,27 +192,66 @@ define_class!(
             self.refresh();
         }
 
+        #[unsafe(method(toggleClaude:))]
+        fn toggle_claude(&self, _sender: Option<&AnyObject>) {
+            let cur = self.ivars().show_claude.get();
+            let other = self.ivars().show_antigravity.get();
+            if cur && !other {
+                return; // At least one provider must remain selected
+            }
+            self.set_provider_visibility(Provider::Claude, !cur);
+        }
+
+        #[unsafe(method(toggleAntigravity:))]
+        fn toggle_antigravity(&self, _sender: Option<&AnyObject>) {
+            let cur = self.ivars().show_antigravity.get();
+            let other = self.ivars().show_claude.get();
+            if cur && !other {
+                return; // At least one provider must remain selected
+            }
+            self.set_provider_visibility(Provider::Antigravity, !cur);
+        }
+
+        #[unsafe(method(openClaudePage:))]
+        fn open_claude_page(&self, _sender: Option<&AnyObject>) {
+            if let Some(url) = NSURL::URLWithString(&NSString::from_str(Provider::Claude.usage_page())) {
+                NSWorkspace::sharedWorkspace().openURL(&url);
+            }
+        }
+
+        #[unsafe(method(openAntigravityPage:))]
+        fn open_antigravity_page(&self, _sender: Option<&AnyObject>) {
+            if let Some(url) = NSURL::URLWithString(&NSString::from_str(Provider::Antigravity.usage_page())) {
+                NSWorkspace::sharedWorkspace().openURL(&url);
+            }
+        }
+
         #[unsafe(method(toggleLaunchAtLogin:))]
         fn toggle_launch_at_login(&self, _sender: Option<&AnyObject>) {
             set_launch_at_login(!launch_at_login());
-        }
-
-        #[unsafe(method(openUsagePage:))]
-        fn open_usage_page(&self, _sender: Option<&AnyObject>) {
-            if let Some(url) = NSURL::URLWithString(&NSString::from_str(USAGE_PAGE)) {
-                NSWorkspace::sharedWorkspace().openURL(&url);
-            }
         }
     }
 );
 
 impl NotchView {
-    fn new(mtm: MainThreadMarker, shape: Retained<CAShapeLayer>) -> Retained<Self> {
+    pub fn new(mtm: MainThreadMarker, shape: Retained<CAShapeLayer>) -> Retained<Self> {
+        let cfg = usage::Config::load();
+        Self::with_config(mtm, shape, cfg.show_claude, cfg.show_antigravity)
+    }
+
+    pub fn with_config(
+        mtm: MainThreadMarker,
+        shape: Retained<CAShapeLayer>,
+        show_claude: bool,
+        show_antigravity: bool,
+    ) -> Retained<Self> {
         let ivars = Ivars::default();
         let _ = ivars.shape.set(shape);
+        ivars.show_claude.set(show_claude);
+        ivars.show_antigravity.set(show_antigravity);
         let this = Self::alloc(mtm).set_ivars(ivars);
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
-        this.setWantsLayer(true); // content opacity is animated on its layer
+        this.setWantsLayer(true);
         let area = unsafe {
             NSTrackingArea::initWithRect_options_owner_userInfo(
                 NSTrackingArea::alloc(),
@@ -218,6 +272,81 @@ impl NotchView {
         this
     }
 
+    fn active_providers(&self) -> Vec<Provider> {
+        let iv = self.ivars();
+        let mut list = Vec::new();
+        if iv.show_claude.get() {
+            list.push(Provider::Claude);
+        }
+        if iv.show_antigravity.get() {
+            list.push(Provider::Antigravity);
+        }
+        if list.is_empty() {
+            list.push(Provider::Claude);
+        }
+        list
+    }
+
+    fn char_state(&self, provider: Provider) -> &CharacterState {
+        let iv = self.ivars();
+        match provider {
+            Provider::Claude => &iv.claude_char,
+            Provider::Antigravity => &iv.antigravity_char,
+        }
+    }
+
+    fn set_provider_visibility(&self, provider: Provider, visible: bool) {
+        let iv = self.ivars();
+        match provider {
+            Provider::Claude => iv.show_claude.set(visible),
+            Provider::Antigravity => iv.show_antigravity.set(visible),
+        }
+        save_provider_config(iv.show_claude.get(), iv.show_antigravity.get());
+        self.update_accessibility();
+
+        // Immediately update window frame and morph smoothly
+        if let (Some(window), Some((collapsed, expanded)), Some(shape)) = (self.window(), self.frames(), iv.shape.get()) {
+            let target = if iv.expanded.get() { expanded } else { collapsed };
+            let current = window.frame();
+            if reduce_motion() {
+                window.setFrame_display(target, true);
+                shape.setPath(Some(&notch_path(local(target, target), self.radius(iv.expanded.get()))));
+                self.setNeedsDisplay(true);
+                return;
+            }
+
+            let gen = iv.anim_gen.get() + 1;
+            iv.anim_gen.set(gen);
+            iv.animating.set(true);
+
+            // Bounding box union for smooth expansion/contraction
+            let min_x = current.origin.x.min(target.origin.x);
+            let min_y = current.origin.y.min(target.origin.y);
+            let max_x = (current.origin.x + current.size.width).max(target.origin.x + target.size.width);
+            let max_y = (current.origin.y + current.size.height).max(target.origin.y + target.size.height);
+            let union_rect = NSRect::new(pt(min_x, min_y), NSSize::new(max_x - min_x, max_y - min_y));
+
+            window.setFrame_display(union_rect, false);
+
+            let from = presented_path(shape).unwrap_or_else(|| notch_path(local(current, union_rect), self.radius(iv.expanded.get())));
+            let to = notch_path(local(target, union_rect), self.radius(iv.expanded.get()));
+            let settle_in = morph(shape, Some(&from), &to, iv.expanded.get());
+
+            self.setNeedsDisplay(true);
+            let view = self.retain();
+            after(settle_in, move || {
+                let iv = view.ivars();
+                if iv.anim_gen.get() != gen {
+                    return;
+                }
+                iv.animating.set(false);
+                view.settle();
+            });
+        } else {
+            self.settle();
+        }
+    }
+
     fn menu(&self) -> Retained<NSMenu> {
         let mtm = self.mtm();
         let menu = NSMenu::new(mtm);
@@ -225,9 +354,34 @@ impl NotchView {
             let it = NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), title, Some(action), ns_string!(""));
             it.setTarget(target);
             menu.addItem(&it);
+            it
         };
         item(ns_string!("Refresh Now"), sel!(refreshNow:), Some(self));
-        item(ns_string!("Open Usage Page"), sel!(openUsagePage:), Some(self));
+
+        let show_c = self.ivars().show_claude.get();
+        let show_a = self.ivars().show_antigravity.get();
+
+        if show_c {
+            item(ns_string!("Open Claude Usage Page"), sel!(openClaudePage:), Some(self));
+        }
+        if show_a {
+            item(ns_string!("Open Antigravity Page"), sel!(openAntigravityPage:), Some(self));
+        }
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        // Provider toggles
+        let c_item = item(ns_string!("Claude Code"), sel!(toggleClaude:), Some(self));
+        c_item.setState(if show_c { NSControlStateValueOn } else { NSControlStateValueOff });
+        if show_c && !show_a {
+            c_item.setEnabled(false);
+        }
+
+        let a_item = item(ns_string!("Antigravity"), sel!(toggleAntigravity:), Some(self));
+        a_item.setState(if show_a { NSControlStateValueOn } else { NSControlStateValueOff });
+        if show_a && !show_c {
+            a_item.setEnabled(false);
+        }
+
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         // Launch at Login (only meaningful for the installed .app).
         unsafe {
@@ -267,19 +421,33 @@ impl NotchView {
         });
     }
 
+    fn total_left_width(&self, notch_h: f64) -> f64 {
+        let providers = self.active_providers();
+        let mut total = theme::EAR_OUTER;
+        for (i, &p) in providers.iter().enumerate() {
+            if i > 0 {
+                total += PROVIDER_GAP;
+            }
+            let snap = snapshot_for(p);
+            let ear = ProviderEar::new(p, snap.as_ref(), notch_h, false);
+            total += ear.content_w;
+        }
+        total + theme::EAR_INNER
+    }
+
     /// Settled (collapsed, expanded) panel frames in screen coordinates.
     fn frames(&self) -> Option<(NSRect, NSRect)> {
         let g = Geometry::current(self.mtm())?;
         self.ivars().notch_h.set(g.notch_h);
-        let snap = snapshot();
-        // Collapsed ears hug their own content, so the two sides may differ in width.
-        let (lw, _) = Ears::new(snap.as_ref(), g.notch_h, false).widths();
-        // Nothing on the right: end the blob inside the camera cutout so our corner and
-        // flare hide behind the hardware and only the notch's own curve shows.
+        let lw = self.total_left_width(g.notch_h);
         let rw = -(g.notch_w / 2.0);
-        let rows = snap.map_or(2, |s| rows(&s).len().max(1)) as f64;
-        let (cw, ew) = (lw + g.notch_w + rw + 2.0 * FLARE, (g.notch_w + 2.0 * FLARE + 2.0 * lw.max(rw)).max(EXPANDED_W));
-        let eh = expanded_height(g.notch_h, rows);
+
+        let active = self.active_providers();
+        let (cw, ew) = (
+            lw + g.notch_w + rw + 2.0 * FLARE,
+            (g.notch_w + 2.0 * FLARE + 2.0 * lw.max(rw)).max(EXPANDED_W),
+        );
+        let eh = multi_expanded_height(g.notch_h, &active);
         let notch_left = g.center_x - g.notch_w / 2.0;
         let collapsed = NSRect::new(pt(notch_left - FLARE - lw, g.top - g.notch_h), NSSize::new(cw, g.notch_h));
         let expanded = NSRect::new(pt(g.center_x - ew / 2.0, g.top - eh), NSSize::new(ew, eh));
@@ -315,15 +483,10 @@ impl NotchView {
         iv.anim_gen.set(gen);
         iv.animating.set(true);
 
-        // Morph inside a panel-sized window, starting from whatever is on screen. Only a
-        // collapsed-size window is grown first; an already-large one (open, or mid-morph)
-        // is kept as is, so text width changes can't make us restart from the wrong shape.
         let current = window.frame();
         let (morph_frame, from) = if current.size.height > collapsed.size.height + 0.5 {
             (current, presented_path(shape))
         } else {
-            // Freshly grown: the presentation layer still holds the old small-window path
-            // (which would sit at the bottom), so start explicitly from the notch at the top.
             window.setFrame_display(expanded, false);
             (expanded, Some(notch_path(local(collapsed, expanded), self.radius(false))))
         };
@@ -343,11 +506,11 @@ impl NotchView {
         after(settle_in, move || {
             let iv = view.ivars();
             if iv.anim_gen.get() != gen {
-                return; // superseded by a newer morph
+                return;
             }
             iv.animating.set(false);
             let collapsed = !iv.expanded.get();
-            view.settle(); // snap the window to the exact final frame
+            view.settle();
             if collapsed {
                 fade(&view, 0.0, 1.0, 0.0, 0.1);
             }
@@ -378,13 +541,11 @@ impl NotchView {
         self.update_teeter();
     }
 
-    /// Clawd's displayed offset along the bar for a new `target`: starts a walk when the
-    /// spot he should stand on moves (data changed), else continues the current one.
-    /// Returns (offset, walking, direction −1/0/1).
-    fn walk_to(&self, target: f64) -> (f64, bool, f64) {
-        let iv = self.ivars();
+    /// Character displayed offset along the bar for a new `target`.
+    fn walk_to(&self, provider: Provider, target: f64) -> (f64, bool, f64) {
+        let cs = self.char_state(provider);
         let now = media_now();
-        let mut walk = iv.walk.get();
+        let mut walk = cs.walk.get();
         if walk.to.is_nan() || reduce_motion() {
             walk = Walk { from: target, to: target, start: now, duration: 0.0 };
         } else if (target - walk.to).abs() > 1e-6 {
@@ -396,43 +557,58 @@ impl NotchView {
                 let duration = (distance / theme::WALK_SPEED).clamp(0.4, 2.5);
                 Walk { from: here, to: target, start: now, duration }
             };
-            iv.walk.set(walk);
-            self.update_teeter(); // make sure frames keep coming while he walks
+            cs.walk.set(walk);
+            self.update_teeter();
         }
-        iv.walk.set(walk);
+        cs.walk.set(walk);
         let (x, walking) = walk.at(now);
         (x, walking, (walk.to - walk.from).signum())
     }
 
-    /// Run a light redraw timer only while Clawd is moving: always when teetering (red),
-    /// during short tremble bursts (yellow), never when calm.
+    /// Run a light redraw timer only while any active character is moving.
     fn update_teeter(&self) {
         let iv = self.ivars();
-        let stance = {
-            let ears = Ears::new(snapshot().as_ref(), iv.notch_h.get(), false);
-            perch(ears.week_left).1
-        };
+        let notch_h = iv.notch_h.get();
         let now = media_now();
-        let walking = iv.walk.get().at(now).1;
-        let moving = walking
-            || match stance {
-                Stance::Teeter => true,
-                Stance::Gone => now < iv.gone_start.get() + theme::GONE_ANIM,
-                Stance::Tremble => now < iv.tremble_until.get(),
-                Stance::Calm => false,
-            };
-        let need = !iv.shown_expanded.get() && !reduce_motion() && moving;
+        let motion = !reduce_motion();
+
+        let mut moving = false;
+        for &p in &self.active_providers() {
+            let snap = snapshot_for(p);
+            let ears = ProviderEar::new(p, snap.as_ref(), notch_h, false);
+            let (_, stance) = perch(ears.week_left);
+            let cs = self.char_state(p);
+            let walking = cs.walk.get().at(now).1;
+            let is_moving = walking
+                || match stance {
+                    Stance::Teeter => true,
+                    Stance::Gone => now < cs.gone_start.get() + theme::GONE_ANIM,
+                    Stance::Tremble => now < cs.tremble_until.get(),
+                    Stance::Calm => false,
+                };
+            if is_moving {
+                moving = true;
+                break;
+            }
+        }
+
+        let need = !iv.shown_expanded.get() && motion && moving;
         let mut timer = iv.teeter.borrow_mut();
         if need && timer.is_none() {
             let view = self.retain();
-            // Only Clawd's area is invalidated, so the session text isn't re-laid out each frame.
             let block = RcBlock::new(move |_: NonNull<NSTimer>| {
-                let h = view.bounds().size.height;
-                view.setNeedsDisplayInRect(NSRect::new(pt(0.0, 0.0), NSSize::new(session_text_x(), h)));
-                let iv = view.ivars();
+                view.setNeedsDisplay(true);
                 let now = media_now();
-                if iv.tremble_until.get() <= now && !iv.walk.get().at(now).1 {
-                    view.update_teeter(); // burst/walk over → stops unless teetering
+                let mut any_moving = false;
+                for &p in &view.active_providers() {
+                    let cs = view.char_state(p);
+                    if cs.tremble_until.get() > now || cs.walk.get().at(now).1 {
+                        any_moving = true;
+                        break;
+                    }
+                }
+                if !any_moving {
+                    view.update_teeter();
                 }
             });
             let t = unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.0 / 12.0, true, &block) };
@@ -445,18 +621,20 @@ impl NotchView {
         }
     }
 
-    /// Fires every few seconds (randomised): blink and pick up new data.
+    /// Fires every few seconds: blink and pick up new data.
     fn tick(&self) {
         let iv = self.ivars();
-        let version = snapshot().map_or(0, |s| s.version);
+        let v_c = snapshot_for(Provider::Claude).map_or(0, |s| s.version);
+        let v_a = snapshot_for(Provider::Antigravity).map_or(0, |s| s.version);
+        let version = v_c + v_a;
         if iv.seen_version.replace(version) != version {
             iv.refreshing.set(false);
             self.update_accessibility();
         }
-        // Row count (expanded) or ear text width (collapsed) may have changed.
         self.settle();
-        // Yellow band: a short shiver every tick.
-        iv.tremble_until.set(media_now() + theme::TREMBLE_BURST);
+        let now = media_now();
+        iv.claude_char.tremble_until.set(now + theme::TREMBLE_BURST);
+        iv.antigravity_char.tremble_until.set(now + theme::TREMBLE_BURST);
         self.update_teeter();
         iv.blink.set(true);
         self.setNeedsDisplay(true);
@@ -468,200 +646,230 @@ impl NotchView {
     }
 
     fn update_accessibility(&self) {
-        let label = match snapshot() {
-            None => "Claude usage: loading".to_string(),
-            Some(s) => {
-                let parts: Vec<String> = rows(&s)
-                    .into_iter()
-                    .map(|(name, l)| {
-                        let reset = l.resets_at.map_or(String::new(), |at| format!(", resets in {}", countdown(at)));
-                        format!("{name} {} left{reset}", pct(l.left()))
-                    })
-                    .collect();
-                format!("Claude usage: {}", parts.join("; "))
-            }
-        };
+        let mut parts: Vec<String> = Vec::new();
+        for &p in &self.active_providers() {
+            let label = match snapshot_for(p) {
+                None => format!("{}: loading", p.display_name()),
+                Some(s) => {
+                    let rows_str: Vec<String> = rows_for(p, &s)
+                        .into_iter()
+                        .map(|(name, l)| {
+                            let reset = l.resets_at.map_or(String::new(), |at| format!(", resets in {}", countdown(at)));
+                            format!("{name} {} left{reset}", pct(l.left()))
+                        })
+                        .collect();
+                    format!("{}: {}", p.display_name(), rows_str.join("; "))
+                }
+            };
+            parts.push(label);
+        }
+        let total_label = parts.join(" | ");
         unsafe {
-            let _: () = msg_send![self, setAccessibilityLabel: &*NSString::from_str(&label)];
+            let _: () = msg_send![self, setAccessibilityLabel: &*NSString::from_str(&total_label)];
         }
     }
 
-    fn draw(&self, dirty: NSRect) {
+    fn draw(&self, _dirty: NSRect) {
         let b = self.bounds();
         let w = b.size.width;
         let iv = self.ivars();
         let notch_h = iv.notch_h.get().max(1.0);
         let expanded = iv.shown_expanded.get();
-        let scale = self.window().map_or(2.0, |w| w.backingScaleFactor());
-        let snap = snapshot();
-        let stale = snap.as_ref().is_some_and(|s| s.error.is_some() || usage::now() - s.fetched_at > 600);
-        let mood = Mood::of(snap.as_ref());
+        let scale = self.window().map_or(2.0, |win| win.backingScaleFactor());
+        let active = self.active_providers();
 
         if !expanded {
-            let ears = Ears::new(snap.as_ref(), notch_h, stale);
-            // Every piece sits on one baseline, centred on the hero number's cap height.
-            let baseline = notch_h / 2.0 + ears.session_ty.size * 0.36;
-            let top = |ty: &Type| baseline - ty.size * 0.97;
-
-            let session = &ears.session;
-
-            // Left ear: Clawd standing on the weekly bar (7 day-segments, lit = weekly left).
-            let sprite = ears.sprite;
-            let u = sprite / 24.0;
-            let clawd_h = sprite * 15.0 / 24.0;
-            let bar_y = (notch_h - clawd_h - theme::WEEK_BAR_H) / 2.0 + clawd_h;
-            let bar_x = FLARE + theme::EAR_OUTER;
-            week_bar(bar_x, bar_y, ears.week_left, ears.week_color);
-            let now = media_now();
             let motion = !reduce_motion();
-            let (segments, stance) = perch(ears.week_left);
-            let stand_cy = bar_y - clawd_h / 2.0;
+            let now = media_now();
 
-            NSGraphicsContext::saveGraphicsState_class();
-            // Nothing may spill outside the black blob (e.g. near the rounded corner).
-            collapsed_outline(w, notch_h, self.radius(false)).addClip();
-            let rotate = |pivot: (f64, f64), degrees: f64, shift: f64| {
-                if degrees != 0.0 || shift != 0.0 {
-                    let t = NSAffineTransform::transform();
-                    t.translateXBy_yBy(pivot.0 + shift, pivot.1);
-                    t.rotateByDegrees(degrees);
-                    t.translateXBy_yBy(-pivot.0, -pivot.1);
-                    t.concat();
+            let mut cur_x = FLARE + theme::EAR_OUTER;
+            for (idx, &p) in active.iter().enumerate() {
+                let snap = snapshot_for(p);
+                let stale = snap.as_ref().is_some_and(|s| s.error.is_some() || usage::now() - s.fetched_at > 600);
+                let ear = ProviderEar::new(p, snap.as_ref(), notch_h, stale);
+                let cs = self.char_state(p);
+
+                if idx > 0 {
+                    // Hairline separator between side-by-side providers
+                    let sep_x = cur_x - PROVIDER_GAP / 2.0;
+                    let sep_h = notch_h * 0.35;
+                    let sep_y = (notch_h - sep_h) / 2.0;
+                    pill(sep_x - 0.5, sep_y, 1.0, sep_h, theme::TRACK);
                 }
-            };
-            if stance == Stance::Gone {
-                // 0%: he lets go, drops out of sight, then pops back up — only his head shows
-                // above the bottom edge. Kept clear of the rounded corner.
-                let (was_x, _) = iv.walk.get().at(now);
-                let from_x = if was_x.is_nan() { bar_x } else { bar_x + was_x };
-                // Head pokes up to just under the bar, eyes showing; the rest is below the edge.
-                let peek_cy = bar_y + theme::WEEK_BAR_H + 0.5 + 7.5 * u;
-                let peek = ((bar_x + 12.0 * u).max(FLARE + self.radius(false) + 12.0 * u), peek_cy);
-                if !iv.gone.replace(true) {
-                    iv.gone_start.set(if was_x.is_nan() { f64::NEG_INFINITY } else { now });
-                    self.update_teeter();
-                }
-                let t = if motion { now - iv.gone_start.get() } else { f64::INFINITY };
-                let hidden = notch_h + 9.0 * u;
-                let start_y = stand_cy; // where he was teetering
-                let hang_x = from_x;
-                let cy = if t < 0.25 {
-                    let k = t / 0.25;
-                    start_y + (hidden - start_y) * k * k
-                } else if t < 0.8 {
-                    hidden
-                } else if t < theme::GONE_ANIM {
-                    let k = (t - 0.8) / (theme::GONE_ANIM - 0.8);
-                    hidden + (peek.1 - hidden) * (1.0 - (1.0 - k) * (1.0 - k))
-                } else {
-                    peek.1
+
+                let bar_x = cur_x;
+                let sprite = ear.sprite;
+                let u = sprite / 24.0;
+                let char_h = sprite * 15.0 / 24.0;
+                let bar_y = (notch_h - char_h - theme::WEEK_BAR_H) / 2.0 + char_h;
+                week_bar(bar_x, bar_y, ear.week_left, ear.week_color);
+
+                let (segments, stance) = perch(ear.week_left);
+                let stand_cy = bar_y - char_h / 2.0;
+                let mood = Mood::of(snap.as_ref());
+
+                NSGraphicsContext::saveGraphicsState_class();
+                collapsed_outline(w, notch_h, self.radius(false)).addClip();
+
+                let rotate = |pivot: (f64, f64), degrees: f64, shift: f64| {
+                    if degrees != 0.0 || shift != 0.0 {
+                        let t = NSAffineTransform::transform();
+                        t.translateXBy_yBy(pivot.0 + shift, pivot.1);
+                        t.rotateByDegrees(degrees);
+                        t.translateXBy_yBy(-pivot.0, -pivot.1);
+                        t.concat();
+                    }
                 };
-                let cx = if t < 0.25 { hang_x + (peek.0 - hang_x) * (t / 0.25) } else { peek.0 };
-                critter(cx, cy, sprite, scale, Mood::Busy, Pose { blink: iv.blink.get(), ..Pose::default() });
-            } else if stance == Stance::Teeter {
-                iv.gone.set(false);
-                // Red: walk to the very edge of what's left, then teeter over the drop —
-                // leaning and wobbling, wide eyes, open mouth, sweat, flapping arms.
-                let (offset, walking, dir) = self.walk_to(lit_edge(ears.week_left));
-                let cx = bar_x + offset;
-                if !walking {
-                    rotate((cx, bar_y), teeter_degrees(ears.week_left), 0.0);
-                }
-                let step = walking.then(|| (now / 0.14) as i64 % 2 == 0);
-                let pose = Pose { panic: if walking { 0.0 } else { 1.0 }, step, look: dir * 0.6, ..Pose::default() };
-                critter(cx, stand_cy, sprite, scale, mood, pose);
-            } else {
-                iv.gone.set(false);
-                // Walk to the middle of the segments that are left (only moves when a whole
-                // segment goes), then tremble there if yellow.
-                let (offset, walking, dir) = self.walk_to(segments_centre(segments));
-                let cx = bar_x + offset;
-                let shiver = stance == Stance::Tremble && !walking && motion && now < iv.tremble_until.get();
-                if shiver {
-                    let wobble = (now * std::f64::consts::TAU * 13.0).sin();
-                    rotate((cx, bar_y), 1.6 * wobble, 0.5 * wobble);
-                }
-                let face = if stance == Stance::Tremble { Mood::Careful } else { mood }; // sweat drop
-                // Walking: alternate leg pairs every 0.14 s, a tiny bob, eyes toward the way he goes.
-                let step = walking.then(|| (now / 0.14) as i64 % 2 == 0);
-                let bob = if step == Some(true) { -0.4 } else { 0.0 };
-                let pose = Pose { blink: iv.blink.get() && !walking, step, look: dir * 0.6, ..Pose::default() };
-                critter(cx, stand_cy + bob, sprite, scale, face, pose);
-            }
-            NSGraphicsContext::restoreGraphicsState_class();
 
-            // Then session left · session reset, still left of the notch.
-            let x = session_text_x();
-            if dirty.origin.x + dirty.size.width <= x {
-                return; // teeter frame: only Clawd needs repainting
+                if stance == Stance::Gone {
+                    let (was_x, _) = cs.walk.get().at(now);
+                    let from_x = if was_x.is_nan() { bar_x } else { bar_x + was_x };
+                    let peek_cy = bar_y + theme::WEEK_BAR_H + 0.5 + 7.5 * u;
+                    let peek = ((bar_x + 12.0 * u).max(FLARE + self.radius(false) + 12.0 * u), peek_cy);
+                    if !cs.gone.replace(true) {
+                        cs.gone_start.set(if was_x.is_nan() { f64::NEG_INFINITY } else { now });
+                        self.update_teeter();
+                    }
+                    let t = if motion { now - cs.gone_start.get() } else { f64::INFINITY };
+                    let hidden = notch_h + 9.0 * u;
+                    let start_y = stand_cy;
+                    let hang_x = from_x;
+                    let cy = if t < 0.25 {
+                        let k = t / 0.25;
+                        start_y + (hidden - start_y) * k * k
+                    } else if t < 0.8 {
+                        hidden
+                    } else if t < theme::GONE_ANIM {
+                        let k = (t - 0.8) / (theme::GONE_ANIM - 0.8);
+                        hidden + (peek.1 - hidden) * (1.0 - (1.0 - k) * (1.0 - k))
+                    } else {
+                        peek.1
+                    };
+                    let cx = if t < 0.25 { hang_x + (peek.0 - hang_x) * (t / 0.25) } else { peek.0 };
+                    draw_character(p, cx, cy, sprite, scale, Mood::Busy, Pose { blink: iv.blink.get(), ..Pose::default() });
+                } else if stance == Stance::Teeter {
+                    cs.gone.set(false);
+                    let (offset, walking, dir) = self.walk_to(p, lit_edge(ear.week_left));
+                    let cx = bar_x + offset;
+                    if !walking {
+                        rotate((cx, bar_y), teeter_degrees(ear.week_left), 0.0);
+                    }
+                    let step = walking.then(|| (now / 0.14) as i64 % 2 == 0);
+                    let pose = Pose { panic: if walking { 0.0 } else { 1.0 }, step, look: dir * 0.6, ..Pose::default() };
+                    draw_character(p, cx, stand_cy, sprite, scale, mood, pose);
+                } else {
+                    cs.gone.set(false);
+                    let (offset, walking, dir) = self.walk_to(p, segments_centre(segments));
+                    let cx = bar_x + offset;
+                    let shiver = stance == Stance::Tremble && !walking && motion && now < cs.tremble_until.get();
+                    if shiver {
+                        let wobble = (now * std::f64::consts::TAU * 13.0).sin();
+                        rotate((cx, bar_y), 1.6 * wobble, 0.5 * wobble);
+                    }
+                    let face = if stance == Stance::Tremble { Mood::Careful } else { mood };
+                    let step = walking.then(|| (now / 0.14) as i64 % 2 == 0);
+                    let bob = if step == Some(true) { -0.4 } else { 0.0 };
+                    let pose = Pose { blink: iv.blink.get() && !walking, step, look: dir * 0.6, ..Pose::default() };
+                    draw_character(p, cx, stand_cy + bob, sprite, scale, face, pose);
+                }
+                NSGraphicsContext::restoreGraphicsState_class();
+
+                // Session text
+                let baseline = notch_h / 2.0 + ear.session_ty.size * 0.36;
+                let top = |ty: &Type| baseline - ty.size * 0.97;
+                let tx = cur_x + theme::week_bar_w() + theme::SESSION_GAP;
+                let tx = tx + text(&ear.session.value, tx, top(&ear.session_ty), &ear.session_ty, ear.session.color, Align::Left);
+                if let Some(r) = &ear.session.reset {
+                    text(r, tx + theme::RESET_GAP, top(&ear.reset_ty), &ear.reset_ty, theme::TEXT_TERTIARY, Align::Left);
+                }
+
+                cur_x += ear.content_w + PROVIDER_GAP;
             }
-            let x = x + text(&session.value, x, top(&ears.session_ty), &ears.session_ty, session.color, Align::Left);
-            if let Some(r) = &session.reset {
-                text(r, x + theme::RESET_GAP, top(&ears.reset_ty), &ears.reset_ty, theme::TEXT_TERTIARY, Align::Left);
-            }
-            let _ = w;
             return;
         }
 
-        // Header: Clawd + mood line + status line.
-        let top = notch_h + 10.0;
-        critter(FLARE + PAD + 18.0, top + 18.0, 36.0, scale, mood, Pose { blink: iv.blink.get(), ..Pose::default() });
-        let x = FLARE + PAD + 48.0;
-        text(mood.title(), x, top + 4.0, &theme::TITLE, theme::TEXT_PRIMARY, Align::Left);
-        let status = match snap.as_ref() {
-            _ if iv.refreshing.get() => "Refreshing…".to_string(),
-            None => "Loading…".to_string(),
-            Some(s) => match (s.error, s.fetched_at) {
-                (Some(e), 0) => e.to_string(),
-                (Some(e), t) => format!("{e} · data {}", ago(usage::now() - t)),
-                (None, t) => format!("Updated {} · click to refresh", ago(usage::now() - t)),
-            },
-        };
-        text(&status, x, top + 23.0, &theme::CAPTION, theme::TEXT_SECONDARY, Align::Left);
-
-        // Limit rows.
-        let Some(snap) = snap else { return };
+        // Expanded Panel: Render distinct section for each active provider
         let (left, right) = (FLARE + PAD, w - FLARE - PAD);
-        let bar_x = left + theme::COL_BAR_X;
-        let bar_w = (right - theme::COL_BAR_END) - bar_x;
-        let oy = top + theme::HEADER_H;
-        text("REMAINING", bar_x, oy, &theme::OVERLINE, theme::TEXT_TERTIARY, Align::Left);
-        text("RESETS IN", right, oy, &theme::OVERLINE, theme::TEXT_TERTIARY, Align::Right);
-        for (i, (name, l)) in rows(&snap).into_iter().enumerate() {
-            let y = oy + theme::OVERLINE_H + i as f64 * theme::ROW_H;
-            let left_pct = l.left();
-            let c = if stale { theme::TEXT_TERTIARY } else { theme::remaining(left_pct) };
-            text(name, left, y, &theme::LABEL, theme::TEXT_SECONDARY, Align::Left);
-            // The bar shows what's LEFT, so it shrinks as you use Claude — same as the number.
-            let by = y + 4.0;
-            pill(bar_x, by, bar_w, theme::BAR_H, theme::TRACK);
-            if left_pct > 0.0 {
-                pill(bar_x, by, (bar_w * left_pct / 100.0).max(theme::BAR_H), theme::BAR_H, c);
-            }
-            text(&pct(left_pct), right - theme::COL_PCT_R, y - 1.0, &theme::NUMERAL, c, Align::Right);
-            let reset = match l.resets_at {
-                Some(at) if at > usage::now() => reset_label(at),
-                Some(_) => "just reset".to_string(),
-                None => "not started".to_string(),
-            };
-            text(&reset, right, y, &theme::CAPTION, theme::TEXT_SECONDARY, Align::Right);
-        }
+        let mut section_top = notch_h + 10.0;
 
-        let gy = oy + theme::OVERLINE_H + rows(&snap).len() as f64 * theme::ROW_H + theme::GRAPH_GAP;
-        history_graph(&snap, left, gy, right - left, stale);
+        for (idx, &p) in active.iter().enumerate() {
+            if idx > 0 {
+                let div_y = section_top - 8.0;
+                let div_p = NSBezierPath::new();
+                div_p.setLineWidth(0.5);
+                div_p.moveToPoint(pt(left, div_y));
+                div_p.lineToPoint(pt(right, div_y));
+                theme::TRACK.ns().set();
+                div_p.stroke();
+            }
+
+            let snap = snapshot_for(p);
+            let stale = snap.as_ref().is_some_and(|s| s.error.is_some() || usage::now() - s.fetched_at > 600);
+            let mood = Mood::of(snap.as_ref());
+
+            // Section Header: Character + Title + Status
+            draw_character(p, left + 18.0, section_top + 18.0, 36.0, scale, mood, Pose { blink: iv.blink.get(), ..Pose::default() });
+            let hx = left + 48.0;
+            let title = format!("{} · {}", p.display_name(), mood.title());
+            text(&title, hx, section_top + 4.0, &theme::TITLE, theme::TEXT_PRIMARY, Align::Left);
+            let status = match snap.as_ref() {
+                _ if iv.refreshing.get() => "Refreshing…".to_string(),
+                None => "Loading…".to_string(),
+                Some(s) => match (s.error, s.fetched_at) {
+                    (Some(e), 0) => e.to_string(),
+                    (Some(e), t) => format!("{e} · data {}", ago(usage::now() - t)),
+                    (None, t) => format!("Updated {} · click to refresh", ago(usage::now() - t)),
+                },
+            };
+            text(&status, hx, section_top + 23.0, &theme::CAPTION, theme::TEXT_SECONDARY, Align::Left);
+
+            // Limit rows
+            let rows_list = snap.as_ref().map_or_else(Vec::new, |s| rows_for(p, s));
+            let bar_x = left + theme::COL_BAR_X;
+            let bar_w = (right - theme::COL_BAR_END) - bar_x;
+            let oy = section_top + theme::HEADER_H;
+            text("REMAINING", bar_x, oy, &theme::OVERLINE, theme::TEXT_TERTIARY, Align::Left);
+            text("RESETS IN", right, oy, &theme::OVERLINE, theme::TEXT_TERTIARY, Align::Right);
+
+            for (i, (name, l)) in rows_list.iter().enumerate() {
+                let y = oy + theme::OVERLINE_H + i as f64 * theme::ROW_H;
+                let left_pct = l.left();
+                let c = if stale { theme::TEXT_TERTIARY } else { theme::remaining(left_pct) };
+                text(name, left, y, &theme::LABEL, theme::TEXT_SECONDARY, Align::Left);
+                let by = y + 4.0;
+                pill(bar_x, by, bar_w, theme::BAR_H, theme::TRACK);
+                if left_pct > 0.0 {
+                    pill(bar_x, by, (bar_w * left_pct / 100.0).max(theme::BAR_H), theme::BAR_H, c);
+                }
+                text(&pct(left_pct), right - theme::COL_PCT_R, y - 1.0, &theme::NUMERAL, c, Align::Right);
+                let reset = match l.resets_at {
+                    Some(at) if at > usage::now() => reset_label(at),
+                    Some(_) => "just reset".to_string(),
+                    None => "not started".to_string(),
+                };
+                text(&reset, right, y, &theme::CAPTION, theme::TEXT_SECONDARY, Align::Right);
+            }
+
+            let gy = oy + theme::OVERLINE_H + rows_list.len() as f64 * theme::ROW_H + theme::GRAPH_GAP;
+            history_graph_for(p, snap.as_ref(), left, gy, right - left, stale);
+
+            section_top = gy + theme::OVERLINE_H + theme::GRAPH_H + theme::GRAPH_AXIS_H + 20.0;
+        }
     }
 }
 
-/// "THIS SESSION" hairline graph of session % left across the current 5 h window,
-/// with a faint even-pace diagonal from 100% to 0% and hour gridlines.
-fn history_graph(snap: &Snapshot, x: f64, y: f64, w: f64, stale: bool) {
-    let session = snap.five_hour;
+/// "THIS SESSION" hairline graph of session % left across the current 5 h window.
+fn history_graph_for(provider: Provider, snap: Option<&Snapshot>, x: f64, y: f64, w: f64, stale: bool) {
+    let session = snap.and_then(|s| s.five_hour);
     let color = match session {
         Some(l) if !stale => theme::remaining(l.left()),
         _ => theme::TEXT_TERTIARY,
     };
-    text("THIS SESSION", x, y, &theme::OVERLINE, theme::TEXT_TERTIARY, Align::Left);
-    // Axis times are local; say which zone.
+    let graph_title = match provider {
+        Provider::Claude => "THIS SESSION (CLAUDE)",
+        Provider::Antigravity => "THIS SESSION (ANTIGRAVITY)",
+    };
+    text(graph_title, x, y, &theme::OVERLINE, theme::TEXT_TERTIARY, Align::Left);
     let tz = NSTimeZone::systemTimeZone();
     if let Some(abbr) = tz.abbreviation() {
         text(&abbr.to_string(), x + w, y, &theme::OVERLINE, theme::TEXT_TERTIARY, Align::Right);
@@ -697,7 +905,7 @@ fn history_graph(snap: &Snapshot, x: f64, y: f64, w: f64, stale: bool) {
     let axis_y = py(0.0);
     line(&[(x, axis_y), (x + w, axis_y)], theme::GRAPH_AXIS, 0.5);
 
-    // Hour ticks on *local* hour boundaries (handles :30 / :45 offset zones), labelled HH:mm.
+    // Hour ticks on local hour boundaries
     let offset = tz.secondsFromGMT() as i64;
     let mut tick = ((t0 + offset) as f64 / 3600.0).ceil() as i64 * 3600 - offset;
     while tick <= t1 {
@@ -710,17 +918,15 @@ fn history_graph(snap: &Snapshot, x: f64, y: f64, w: f64, stale: bool) {
         text(&label, lx, axis_y + 4.0, &theme::AXIS, theme::TEXT_TERTIARY, Align::Left);
         tick += 3600;
     }
-    // Where we are in the window.
     if now > t0 && now < t1 {
         let nx = px(now);
         line(&[(nx, gy), (nx, axis_y)], theme::GRAPH_NOW, 0.5);
     }
 
-    let samples: Vec<_> = usage::history().into_iter().filter(|s| s.t >= t0).collect();
+    let samples: Vec<Sample> = history_for(provider).into_iter().filter(|s| s.t >= t0).collect();
     if samples.len() < 2 {
         text("Fills in as this session goes", x + w / 2.0 - 64.0, gy + h / 2.0 - 7.0, &theme::CAPTION, theme::TEXT_TERTIARY, Align::Left);
     }
-    // Gaps > 30 min (app not running) aren't joined.
     let mut runs: Vec<Vec<(f64, f64)>> = Vec::new();
     let mut last_t = i64::MIN;
     for s in &samples {
@@ -740,26 +946,55 @@ fn history_graph(snap: &Snapshot, x: f64, y: f64, w: f64, stale: bool) {
     }
 }
 
-/// What the collapsed ears show: "Clawd on the weekly bar | notch | 94% 4h42".
-struct Ears {
-    session: Side,
-    /// Weekly % left (100 when unknown) and the colour its lit segments use.
-    week_left: f64,
-    week_color: Color,
-    /// Session % — the hero number.
-    session_ty: Type,
-    reset_ty: Type,
-    sprite: f64,
+pub struct Ears {
+    pub session: Side,
+    pub week_left: f64,
+    pub week_color: Color,
+    pub session_ty: Type,
+    pub reset_ty: Type,
+    pub sprite: f64,
 }
 
-struct Side {
-    value: String,
-    color: Color,
-    reset: Option<String>,
+pub struct Side {
+    pub value: String,
+    pub color: Color,
+    pub reset: Option<String>,
 }
 
 impl Ears {
-    fn new(snap: Option<&Snapshot>, notch_h: f64, stale: bool) -> Self {
+    pub fn new(snap: Option<&Snapshot>, notch_h: f64, stale: bool) -> Self {
+        let ear = ProviderEar::new(Provider::Claude, snap, notch_h, stale);
+        Ears {
+            session: ear.session,
+            week_left: ear.week_left,
+            week_color: ear.week_color,
+            session_ty: ear.session_ty,
+            reset_ty: ear.reset_ty,
+            sprite: ear.sprite,
+        }
+    }
+
+    pub fn widths(&self) -> (f64, f64) {
+        let session = measure(&self.session.value, &self.session_ty)
+            + self.session.reset.as_ref().map_or(0.0, |r| theme::RESET_GAP + measure(r, &self.reset_ty));
+        (session_text_x() - FLARE + session + theme::EAR_INNER, 0.0)
+    }
+}
+
+struct ProviderEar {
+    #[allow(dead_code)]
+    provider: Provider,
+    session: Side,
+    week_left: f64,
+    week_color: Color,
+    session_ty: Type,
+    reset_ty: Type,
+    sprite: f64,
+    content_w: f64,
+}
+
+impl ProviderEar {
+    fn new(provider: Provider, snap: Option<&Snapshot>, notch_h: f64, stale: bool) -> Self {
         let size = (notch_h / 2.9).clamp(9.5, theme::MICRO.size);
         let (five, week) = snap.map_or((None, None), |s| (s.five_hour, s.seven_day));
         let session = match five {
@@ -780,27 +1015,29 @@ impl Ears {
             Some(l) => (l.left(), theme::TEXT_TERTIARY),
             None => (100.0, theme::TRACK),
         };
-        Ears {
+        let session_ty = Type { size: (size + 1.5).min(notch_h * 0.45), ..theme::MICRO_HERO };
+        let reset_ty = Type { size: size - 1.5, ..theme::MICRO_LABEL };
+        let sprite = ((notch_h - theme::WEEK_BAR_H - 12.0) * 24.0 / 15.0).clamp(16.0, 22.0);
+
+        let text_w = measure(&session.value, &session_ty)
+            + session.reset.as_ref().map_or(0.0, |r| theme::RESET_GAP + measure(r, &reset_ty));
+        let content_w = theme::week_bar_w() + theme::SESSION_GAP + text_w;
+
+        ProviderEar {
+            provider,
             session,
             week_left,
             week_color,
-            session_ty: Type { size: (size + 1.5).min(notch_h * 0.45), ..theme::MICRO_HERO },
-            reset_ty: Type { size: size - 1.5, ..theme::MICRO_LABEL },
-            sprite: ((notch_h - theme::WEEK_BAR_H - 12.0) * 24.0 / 15.0).clamp(16.0, 22.0),
+            session_ty,
+            reset_ty,
+            sprite,
+            content_w,
         }
-    }
-
-    /// Content widths of the (left, right) ears, excluding the flares.
-    /// Everything lives left of the notch; the right side ends at the cutout.
-    fn widths(&self) -> (f64, f64) {
-        let session = measure(&self.session.value, &self.session_ty)
-            + self.session.reset.as_ref().map_or(0.0, |r| theme::RESET_GAP + measure(r, &self.reset_ty));
-        (session_text_x() - FLARE + session + theme::EAR_INNER, 0.0)
     }
 }
 
-/// Where the session text starts in the collapsed panel (after Clawd's bar).
-fn session_text_x() -> f64 {
+/// Where the session text starts in the collapsed panel (after first character's bar).
+pub fn session_text_x() -> f64 {
     FLARE + theme::EAR_OUTER + theme::week_bar_w() + theme::SESSION_GAP
 }
 
@@ -829,12 +1066,11 @@ enum Stance {
     Tremble,
     /// Red: pushed to the very edge, about to fall.
     Teeter,
-    /// 0%: fell off entirely; only his head peeks up from the bottom.
+    /// 0%: fell off entirely; only head peeks up from the bottom.
     Gone,
 }
 
-/// (segments still lit, stance) for a weekly % left. Clawd only moves when the
-/// segment count changes; the stance follows the status colour bands.
+/// (segments still lit, stance) for a weekly % left.
 fn perch(left: f64) -> (usize, Stance) {
     let units = 7.0 * left.clamp(0.0, 100.0) / 100.0;
     let segments = (units.ceil() as usize).min(7);
@@ -856,13 +1092,12 @@ fn teeter_degrees(left: f64) -> f64 {
     }
     let period = 1.1 - 0.45 * severity;
     let phase = media_now() * std::f64::consts::TAU / period;
-    // Mostly leaning toward the drop, with quick catches back.
     lean + (5.0 + 6.0 * severity) * phase.sin()
 }
 
 /// The collapsed blob's outline in this (flipped) view: square top with flares,
-/// rounded bottom — used to clip Clawd so he never draws outside the black.
-fn collapsed_outline(w: f64, h: f64, r: f64) -> Retained<NSBezierPath> {
+/// rounded bottom — used to clip characters so they never draw outside the black.
+pub fn collapsed_outline(w: f64, h: f64, r: f64) -> Retained<NSBezierPath> {
     let p = NSBezierPath::new();
     p.moveToPoint(pt(0.0, 0.0));
     p.curveToPoint_controlPoint1_controlPoint2(pt(FLARE, FLARE), pt(FLARE, 0.0), pt(FLARE, 0.0));
@@ -894,12 +1129,12 @@ fn lit_edge(left: f64) -> f64 {
 }
 
 /// Notch-shaped outline for `r` (view coords, y up): square top with concave flares,
-/// rounded bottom. Every state uses the same element list so paths interpolate.
+/// rounded bottom.
 fn notch_path(r: NSRect, radius: f64) -> Retained<CGPath> {
     notch_bezier(r, radius).CGPath()
 }
 
-fn notch_bezier(r: NSRect, radius: f64) -> Retained<NSBezierPath> {
+pub fn notch_bezier(r: NSRect, radius: f64) -> Retained<NSBezierPath> {
     let (l, rt) = (r.origin.x, r.origin.x + r.size.width);
     let (b, t) = (r.origin.y, r.origin.y + r.size.height);
     let p = NSBezierPath::new();
@@ -921,7 +1156,6 @@ fn local(r: NSRect, win: NSRect) -> NSRect {
 }
 
 fn cf_obj(path: &CGPath) -> &AnyObject {
-    // CGPath is toll-free bridged to an Objective-C object.
     unsafe { &*(path as *const CGPath as *const AnyObject) }
 }
 
@@ -934,7 +1168,6 @@ fn presented_path(shape: &CAShapeLayer) -> Option<Retained<CGPath>> {
 /// Spring the shape from `from` to `to`; returns how long until it settles.
 fn morph(shape: &CAShapeLayer, from: Option<&CGPath>, to: &CGPath, expanding: bool) -> f64 {
     let anim = CASpringAnimation::animationWithKeyPath(Some(ns_string!("path")));
-    // Slightly underdamped on the way out (a hint of bounce), near-critical on the way in.
     anim.setMass(1.0);
     anim.setStiffness(if expanding { theme::SPRING_OPEN.0 } else { theme::SPRING_CLOSE.0 });
     anim.setDamping(if expanding { theme::SPRING_OPEN.1 } else { theme::SPRING_CLOSE.1 });
@@ -942,7 +1175,6 @@ fn morph(shape: &CAShapeLayer, from: Option<&CGPath>, to: &CGPath, expanding: bo
         anim.setFromValue(from.map(cf_obj));
         anim.setToValue(Some(cf_obj(to)));
     }
-    // Closing is critically damped, so it's visually done well before `settlingDuration`.
     let settle = anim.settlingDuration().min(if expanding { 0.7 } else { 0.26 });
     anim.setDuration(settle);
     CATransaction::begin();
@@ -985,13 +1217,26 @@ fn media_now() -> f64 {
     CLOCK.with(Cell::get).unwrap_or_else(|| CACurrentMediaTime())
 }
 
-/// Height of the expanded panel for `rows` limit rows.
-fn expanded_height(notch_h: f64, rows: f64) -> f64 {
+/// Height of the expanded panel for multiple provider sections.
+fn multi_expanded_height(notch_h: f64, active: &[Provider]) -> f64 {
+    let graph = theme::GRAPH_GAP + theme::OVERLINE_H + theme::GRAPH_H + theme::GRAPH_AXIS_H;
+    let mut total = notch_h + 10.0;
+    for (i, &p) in active.iter().enumerate() {
+        let snap = snapshot_for(p);
+        let rows_count = snap.as_ref().map_or(2, |s| rows_for(p, s).len().max(1)) as f64;
+        total += theme::HEADER_H + theme::OVERLINE_H + rows_count * theme::ROW_H + graph;
+        if i + 1 < active.len() {
+            total += 20.0;
+        }
+    }
+    total + theme::BOTTOM_PAD
+}
+
+pub fn expanded_height(notch_h: f64, rows: f64) -> f64 {
     let graph = theme::GRAPH_GAP + theme::OVERLINE_H + theme::GRAPH_H + theme::GRAPH_AXIS_H;
     notch_h + 10.0 + theme::HEADER_H + theme::OVERLINE_H + rows * theme::ROW_H + graph + theme::BOTTOM_PAD
 }
 
-/// Launch at Login only works for a bundled .app (SMAppService registers the bundle).
 fn running_as_app() -> bool {
     std::env::current_exe().is_ok_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"))
 }
@@ -1006,7 +1251,6 @@ fn set_launch_at_login(on: bool) {
     if let Err(e) = result {
         eprintln!("launch at login: {}", e.localizedDescription());
     }
-    // macOS may want the user to approve it in System Settings → Login Items.
     if on && unsafe { service.status() } == SMAppServiceStatus::RequiresApproval {
         unsafe { SMAppService::openSystemSettingsLoginItems() };
     }
@@ -1022,14 +1266,12 @@ fn reduce_motion() -> bool {
     NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
 }
 
-/// One-shot main-thread timer.
 fn after(secs: f64, f: impl Fn() + 'static) {
     let block = RcBlock::new(move |_: NonNull<NSTimer>| f());
     let timer = unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(secs, false, &block) };
     timer.setTolerance(secs * 0.2);
 }
 
-/// Cheap xorshift for blink jitter.
 fn jitter(lo: f64, hi: f64) -> f64 {
     thread_local!(static SEED: Cell<u64> = Cell::new(usage::now() as u64 | 1));
     SEED.with(|s| {
@@ -1050,16 +1292,33 @@ fn schedule_tick(view: Retained<NotchView>) {
     });
 }
 
-fn rows(s: &Snapshot) -> Vec<(&'static str, Limit)> {
-    [("Session", s.five_hour), ("Weekly", s.seven_day), ("Opus", s.seven_day_opus), ("Sonnet", s.seven_day_sonnet)]
-        .into_iter()
-        .filter_map(|(n, l)| Some((n, l?)))
-        // Per-model rows that were never used are noise.
-        .filter(|(n, l)| matches!(*n, "Session" | "Weekly") || l.used > 0.0 || l.resets_at.is_some())
-        .collect()
+pub fn rows(s: &Snapshot) -> Vec<(&'static str, Limit)> {
+    rows_for(Provider::Claude, s)
 }
 
-/// Floor, so "100%" really means untouched and "0%" really means out.
+pub fn rows_for(provider: Provider, s: &Snapshot) -> Vec<(&'static str, Limit)> {
+    match provider {
+        Provider::Claude => [
+            ("Session", s.five_hour),
+            ("Weekly", s.seven_day),
+            ("Opus", s.seven_day_opus),
+            ("Sonnet", s.seven_day_sonnet),
+        ]
+        .into_iter()
+        .filter_map(|(n, l)| Some((n, l?)))
+        .filter(|(n, l)| matches!(*n, "Session" | "Weekly") || l.used > 0.0 || l.resets_at.is_some())
+        .collect(),
+
+        Provider::Antigravity => [
+            ("Session", s.five_hour),
+            ("Weekly", s.seven_day),
+        ]
+        .into_iter()
+        .filter_map(|(n, l)| Some((n, l?)))
+        .collect(),
+    }
+}
+
 fn pct(left: f64) -> String {
     if left > 0.0 && left < 1.0 {
         "<1%".to_string()
@@ -1080,18 +1339,15 @@ struct Geometry {
 impl Geometry {
     fn current(mtm: MainThreadMarker) -> Option<Self> {
         let screens = NSScreen::screens(mtm);
-        // Prefer the notched built-in display, else the menu-bar screen.
         let screen = screens.iter().find(|s| s.safeAreaInsets().top > 0.0).or_else(|| screens.firstObject())?;
         let f = screen.frame();
         let inset = screen.safeAreaInsets().top;
         let (center_x, notch_w, notch_h) = if inset > 0.0 {
-            // Centre on the actual camera cutout, between the two usable top areas.
             let (l, r) = (screen.auxiliaryTopLeftArea(), screen.auxiliaryTopRightArea());
             let cut_l = f.origin.x + l.size.width;
             let cut_r = f.origin.x + f.size.width - r.size.width;
             ((cut_l + cut_r) / 2.0, cut_r - cut_l, inset)
         } else {
-            // No notch: a small pill hanging from the menu bar.
             let vf = screen.visibleFrame();
             let h = (f.origin.y + f.size.height - (vf.origin.y + vf.size.height)).clamp(24.0, 32.0);
             (f.origin.x + f.size.width / 2.0, 0.0, h)
@@ -1100,10 +1356,10 @@ impl Geometry {
     }
 }
 
-// ---------- Clawd ----------
+// ---------- Mood & Characters ----------
 
 #[derive(Clone, Copy, PartialEq)]
-enum Mood {
+pub enum Mood {
     Sleepy,
     Happy,
     Busy,
@@ -1112,7 +1368,6 @@ enum Mood {
 }
 
 impl Mood {
-    /// Driven by whichever limit binds first, not just the session.
     fn of(s: Option<&Snapshot>) -> Self {
         let tightest = s.and_then(|s| rows(s).into_iter().map(|(_, l)| l.left()).reduce(f64::min));
         match tightest {
@@ -1123,6 +1378,7 @@ impl Mood {
             Some(_) => Mood::Dizzy,
         }
     }
+
     fn title(self) -> &'static str {
         match self {
             Mood::Sleepy => "Napping · no data yet",
@@ -1135,19 +1391,22 @@ impl Mood {
 }
 
 #[derive(Clone, Copy, Default)]
-struct Pose {
-    blink: bool,
-    panic: f64,
-    step: Option<bool>,
-    look: f64,
+pub struct Pose {
+    pub blink: bool,
+    pub panic: f64,
+    pub step: Option<bool>,
+    pub look: f64,
 }
 
-/// Clawd, drawn from the official Claude Code icon (24×24 viewBox, body spans y 5..20).
-/// `s` is the sprite width; the sprite is 24×15 units, centred on (cx, cy).
-/// Edges are snapped to device pixels so the pixel art stays crisp.
-/// `pose.panic` (0..1) swaps in a startled face and flailing arms; `pose.step` lifts
-/// alternate leg pairs while walking; `pose.look` shifts the eyes (units, ±).
-fn critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, pose: Pose) {
+fn draw_character(provider: Provider, cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, pose: Pose) {
+    match provider {
+        Provider::Claude => critter(cx, cy, s, scale, mood, pose),
+        Provider::Antigravity => antigravity_critter(cx, cy, s, scale, mood, pose),
+    }
+}
+
+/// Clawd, drawn from the official Claude Code icon.
+pub fn critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, pose: Pose) {
     let Pose { blink, panic, step, look } = pose;
     let u = s / 24.0;
     let (x0, y0) = (cx - 12.0 * u, cy - 7.5 * u);
@@ -1158,7 +1417,6 @@ fn critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, pose: Pose) {
         NSBezierPath::fillRect(NSRect::new(pt(l, t), NSSize::new(r - l, b - t)));
     };
     let panicking = panic > 0.0;
-    // Arms flap in opposite directions while panicking.
     let flap = if panicking && !reduce_motion() {
         (media_now() * std::f64::consts::TAU / 0.35).sin() * 1.6 * panic
     } else if panicking {
@@ -1172,15 +1430,12 @@ fn critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, pose: Pose) {
     rect(0.0, 10.95 - flap, 3.0, 3.1); // left arm
     rect(21.0, 10.95 + flap, 3.0, 3.1); // right arm
     for (i, lx) in [4.487, 7.488, 15.0, 18.0].into_iter().enumerate() {
-        // Walking: outer-left + inner-right pair, then the other pair, step up.
         let lifted = step.is_some_and(|phase| phase == (i == 0 || i == 2));
-        rect(lx, 17.0, 1.51, if lifted { 2.0 } else { 3.0 }); // legs
+        rect(lx, 17.0, 1.51, if lifted { 2.0 } else { 3.0 });
     }
 
-    // Eyes are holes in the icon; paint them with the notch black.
     theme::CLAWD_EYE.ns().set();
     if panicking {
-        // Wide eyes glancing down at the drop, mouth open in an "o".
         for ex in [6.6, 17.0] {
             rect(ex, 7.6, 1.9, 3.6);
         }
@@ -1198,7 +1453,6 @@ fn critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, pose: Pose) {
     }
 
     if panicking || matches!(mood, Mood::Careful | Mood::Dizzy) {
-        // sweat drops (two when panicking)
         theme::SWEAT.ns().set();
         rect(22.0, 5.5, 1.3, 1.3);
         rect(22.6, 4.6, 0.7, 0.9);
@@ -1213,24 +1467,155 @@ fn critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, pose: Pose) {
     }
 }
 
+const ANTIGRAVITY_PIXELS: &[(f64, f64, u32)] = &[
+    (5.0, 0.0, 0xF2922E),
+    (6.0, 0.0, 0xF07237),
+    (4.0, 1.0, 0xDAB131),
+    (5.0, 1.0, 0xF6912E),
+    (6.0, 1.0, 0xF37337),
+    (7.0, 1.0, 0xF0583B),
+    (3.0, 2.0, 0x9DC345),
+    (4.0, 2.0, 0xB5B43E),
+    (5.0, 2.0, 0xE2993D),
+    (6.0, 2.0, 0xF67A34),
+    (7.0, 2.0, 0xF86A35),
+    (8.0, 2.0, 0xEF5442),
+    (3.0, 3.0, 0x86C64E),
+    (4.0, 3.0, 0x75B45E),
+    (5.0, 3.0, 0xCC954D),
+    (6.0, 3.0, 0xEF7947),
+    (7.0, 3.0, 0xE16652),
+    (8.0, 3.0, 0xE14F59),
+    (2.0, 4.0, 0x7CC251),
+    (3.0, 4.0, 0x71C25C),
+    (4.0, 4.0, 0x5CA98E),
+    (5.0, 4.0, 0x5C91B3),
+    (6.0, 4.0, 0x8373B0),
+    (7.0, 4.0, 0x746FC3),
+    (8.0, 4.0, 0x995DA8),
+    (9.0, 4.0, 0x9C5B97),
+    (2.0, 5.0, 0x61C37D),
+    (3.0, 5.0, 0x54B880),
+    (4.0, 5.0, 0x4197DE),
+    (7.0, 5.0, 0x4197DE),
+    (8.0, 5.0, 0x706ECE),
+    (9.0, 5.0, 0x8F64B4),
+    (2.0, 6.0, 0x61C37D),
+    (3.0, 6.0, 0x43AEAB),
+    (8.0, 6.0, 0x4A80EA),
+    (9.0, 6.0, 0x6C73D8),
+    (1.0, 7.0, 0x6DC694),
+    (2.0, 7.0, 0x62BAD5),
+    (3.0, 7.0, 0x47A8DC),
+    (8.0, 7.0, 0x3D89FB),
+    (9.0, 7.0, 0x4A81F0),
+    (10.0, 7.0, 0x6579E1),
+    (1.0, 8.0, 0x6BC7A3),
+    (2.0, 8.0, 0x64B6F6),
+    (9.0, 8.0, 0x3886FB),
+    (10.0, 8.0, 0x4881F4),
+    (0.0, 9.0, 0x67B9F4),
+    (1.0, 9.0, 0x64B6F6),
+    (10.0, 9.0, 0x3883F9),
+    (11.0, 9.0, 0x3D85FC),
+];
+
+/// Antigravity character: 12x10 pixel art rainbow gradient arch with matching
+/// personality states (Calm, Tremble, Teeter, Gone, Panic, Sweat).
+pub fn antigravity_critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, pose: Pose) {
+    let Pose { blink, panic, step, look } = pose;
+    let u = s / 24.0;
+    let px_size = 1.45 * u;
+    let x0 = cx - 6.0 * px_size;
+    let y0 = cy - 5.0 * px_size;
+    let snap = |v: f64| (v * scale).round() / scale;
+    let rect = |x: f64, y: f64, w: f64, h: f64| {
+        let (l, t) = (snap(x), snap(y));
+        let (r, b) = (snap(x + w), snap(y + h));
+        NSBezierPath::fillRect(NSRect::new(pt(l, t), NSSize::new((r - l).max(1.0 / scale), (b - t).max(1.0 / scale))));
+    };
+
+    let left_lifted = step.is_some_and(|phase| phase);
+    let right_lifted = step.is_some_and(|phase| !phase);
+
+    // 1. Draw the 50 pixel cells of the rainbow gradient arch
+    for &(px, py, hex) in ANTIGRAVITY_PIXELS {
+        let mut py_lift = 0.0;
+        if left_lifted && px <= 3.0 && py >= 8.0 {
+            py_lift = -0.6 * px_size;
+        } else if right_lifted && px >= 8.0 && py >= 8.0 {
+            py_lift = -0.6 * px_size;
+        }
+        Color::hex(hex).ns().set();
+        rect(x0 + px * px_size, y0 + py * px_size + py_lift, px_size, px_size);
+    }
+
+    // 2. Eyes and facial expressions
+    let panicking = panic > 0.0;
+    let look_offset = (look / 1.45).clamp(-0.4, 0.4) * px_size;
+
+    theme::ANTIGRAVITY_EYE.ns().set();
+    if panicking {
+        // Wide panic eyes
+        let eye_w = 1.3 * px_size;
+        let eye_h = 2.0 * px_size;
+        let eye_top = y0 + 3.8 * px_size;
+        for ex in [3.5, 8.5] {
+            rect(x0 + ex * px_size - eye_w / 2.0, eye_top, eye_w, eye_h);
+        }
+        // Open mouth on the crossbar bridge
+        let mouth_w = 1.8 * px_size;
+        let mouth_h = 1.4 * px_size;
+        rect(x0 + 6.0 * px_size - mouth_w / 2.0, y0 + 4.3 * px_size, mouth_w, mouth_h);
+    } else {
+        let (eye_top, eye_h) = match mood {
+            Mood::Sleepy => (y0 + 4.9 * px_size, 0.5 * px_size),
+            Mood::Dizzy => (y0 + 4.6 * px_size, 0.6 * px_size),
+            _ if blink => (y0 + 4.9 * px_size, 0.5 * px_size),
+            _ => (y0 + 4.2 * px_size, 1.6 * px_size),
+        };
+        let eye_w = 1.0 * px_size;
+        for ex in [3.5, 8.5] {
+            rect(x0 + ex * px_size - eye_w / 2.0 + look_offset, eye_top, eye_w, eye_h);
+        }
+    }
+
+    // 3. Sweat drops during trembling / panicking
+    if panicking || matches!(mood, Mood::Careful | Mood::Dizzy) {
+        theme::SWEAT.ns().set();
+        rect(x0 + 10.3 * px_size, y0 + 1.8 * px_size, 0.9 * px_size, 0.9 * px_size);
+        rect(x0 + 10.7 * px_size, y0 + 1.2 * px_size, 0.5 * px_size, 0.6 * px_size);
+        if panicking {
+            rect(x0 + 0.8 * px_size, y0 + 2.4 * px_size, 0.9 * px_size, 0.9 * px_size);
+            rect(x0 + 1.0 * px_size, y0 + 1.8 * px_size, 0.5 * px_size, 0.6 * px_size);
+        }
+    }
+
+    // 4. Sleepy "z"
+    if mood == Mood::Sleepy && !panicking {
+        let ty = Type { size: (8.0 * u).max(7.0), ..theme::NUMERAL };
+        text("z", x0 + 12.0 * px_size, y0 - 3.5 * px_size, &ty, theme::TEXT_SECONDARY, Align::Left);
+    }
+}
+
 // ---------- drawing helpers ----------
 
-fn pt(x: f64, y: f64) -> NSPoint {
+pub fn pt(x: f64, y: f64) -> NSPoint {
     NSPoint::new(x, y)
 }
 
-fn pill(x: f64, y: f64, w: f64, h: f64, c: Color) {
+pub fn pill(x: f64, y: f64, w: f64, h: f64, c: Color) {
     c.ns().set();
     NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(NSRect::new(pt(x, y), NSSize::new(w, h)), h / 2.0, h / 2.0)
         .fill();
 }
 
-enum Align {
+pub enum Align {
     Left,
     Right,
 }
 
-fn attrs(ty: &Type, color: Color) -> Retained<NSDictionary<NSString, AnyObject>> {
+pub fn attrs(ty: &Type, color: Color) -> Retained<NSDictionary<NSString, AnyObject>> {
     let font = if ty.mono {
         NSFont::monospacedDigitSystemFontOfSize_weight(ty.size, (ty.weight)())
     } else {
@@ -1245,12 +1630,12 @@ fn attrs(ty: &Type, color: Color) -> Retained<NSDictionary<NSString, AnyObject>>
     }
 }
 
-fn measure(s: &str, ty: &Type) -> f64 {
+pub fn measure(s: &str, ty: &Type) -> f64 {
     unsafe { NSString::from_str(s).sizeWithAttributes(Some(&attrs(ty, theme::TEXT_PRIMARY))).width }
 }
 
 /// Draws `s` and returns its width.
-fn text(s: &str, x: f64, y: f64, ty: &Type, color: Color, align: Align) -> f64 {
+pub fn text(s: &str, x: f64, y: f64, ty: &Type, color: Color, align: Align) -> f64 {
     let ns = NSString::from_str(s);
     let attrs = attrs(ty, color);
     unsafe {
@@ -1273,7 +1658,6 @@ fn ago(secs: i64) -> String {
     }
 }
 
-/// "1h 23m" / "2d 5h"
 fn countdown(at: i64) -> String {
     let left = (at - usage::now()).max(0);
     let (d, h, m) = (left / 86400, left % 86400 / 3600, left % 3600 / 60);
@@ -1284,7 +1668,6 @@ fn countdown(at: i64) -> String {
     }
 }
 
-/// Fits the collapsed ear: "42m", "4h12", "2d5h".
 fn short_countdown(at: i64) -> String {
     let left = (at - usage::now()).max(0);
     let (d, h, m) = (left / 86400, left % 86400 / 3600, left % 3600 / 60);
@@ -1295,7 +1678,6 @@ fn short_countdown(at: i64) -> String {
     }
 }
 
-/// Local wall-clock "HH:mm" for axis ticks.
 fn clock(at: i64) -> String {
     thread_local! {
         static FMT: Retained<NSDateFormatter> = {
@@ -1311,7 +1693,6 @@ fn clock(at: i64) -> String {
     })
 }
 
-/// "1h 23m · 14:30" / "2d 5h · Fri 09:00"
 fn reset_label(at: i64) -> String {
     thread_local! {
         static FMT: Retained<NSDateFormatter> = {
@@ -1322,7 +1703,7 @@ fn reset_label(at: i64) -> String {
     }
     let same_day = at - usage::now() < 86400;
     let abs = FMT.with(|f| {
-        f.setTimeZone(Some(&NSTimeZone::systemTimeZone())); // follow time-zone changes
+        f.setTimeZone(Some(&NSTimeZone::systemTimeZone()));
         f.setDateFormat(Some(if same_day { ns_string!("HH:mm") } else { ns_string!("EEE HH:mm") }));
         f.stringFromDate(&NSDate::dateWithTimeIntervalSince1970(at as f64)).to_string()
     });
@@ -1343,7 +1724,6 @@ fn main() {
     let _ = PREVIEW_WEEK.set(preview);
     let _ = DEMO.set(std::env::args().any(|a| a == "--demo"));
     let args: Vec<String> = std::env::args().collect();
-    // `--launch-at-login=on|off` (run from inside the .app): toggle and exit.
     if let Some(v) = args.iter().find_map(|a| a.strip_prefix("--launch-at-login=")) {
         set_launch_at_login(v == "on");
         println!("launch at login: {}", if launch_at_login() { "on" } else { "off" });
@@ -1357,6 +1737,8 @@ fn main() {
         render::readme_frames(mtm, dir);
         return;
     }
+    let show_claude = cfg.show_claude;
+    let show_antigravity = cfg.show_antigravity;
     std::thread::spawn(move || usage::run(cfg, rx));
 
     let panel: Retained<NotchPanel> = unsafe {
@@ -1383,7 +1765,6 @@ fn main() {
             | NSWindowCollectionBehavior::IgnoresCycle,
     );
 
-    // Background view owns the black shape layer; the content view draws on top.
     let root = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
     let bg = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
     bg.setWantsLayer(true);
@@ -1396,7 +1777,7 @@ fn main() {
         shape.setFrame(layer.bounds());
         layer.addSublayer(&shape);
     }
-    let view = NotchView::new(mtm, shape);
+    let view = NotchView::with_config(mtm, shape, show_claude, show_antigravity);
     for v in [&*bg, &**view] {
         v.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
         root.addSubview(v);
@@ -1405,7 +1786,6 @@ fn main() {
     view.settle();
     panel.orderFrontRegardless();
 
-    // Displays added/removed/rearranged → re-hug the notch.
     let v = view.clone();
     let on_screens = RcBlock::new(move |_: NonNull<NSNotification>| v.settle());
     let _screens_obs = unsafe {
@@ -1416,7 +1796,6 @@ fn main() {
             &on_screens,
         )
     };
-    // After sleep, refresh once the network is likely back.
     let on_wake = RcBlock::new(|_: NonNull<NSNotification>| after(3.0, wake_worker));
     let _wake_obs = unsafe {
         NSWorkspace::sharedWorkspace().notificationCenter().addObserverForName_object_queue_usingBlock(
@@ -1438,7 +1817,7 @@ mod tests {
     #[test]
     fn stance_follows_the_colour_bands() {
         assert_eq!(perch(100.0), (7, Stance::Calm));
-        assert_eq!(perch(60.0), (5, Stance::Calm)); // 4.2 units → 5 segments still lit
+        assert_eq!(perch(60.0), (5, Stance::Calm));
         assert_eq!(perch(35.0).1, Stance::Tremble);
         assert_eq!(perch(10.0), (1, Stance::Teeter));
         assert_eq!(perch(0.0), (0, Stance::Gone));
@@ -1446,7 +1825,6 @@ mod tests {
 
     #[test]
     fn clawd_only_moves_when_a_whole_segment_goes() {
-        // 60% and 58% both leave 5 segments → same spot.
         assert_eq!(segments_centre(perch(60.0).0), segments_centre(perch(58.0).0));
         assert!(segments_centre(5) > segments_centre(4));
         assert_eq!(segments_centre(7), theme::week_bar_w() / 2.0);
@@ -1456,5 +1834,54 @@ mod tests {
     fn teeters_on_the_lit_edge() {
         assert!((lit_edge(10.0) - 0.7 * theme::WEEK_SEG_W).abs() < 1e-9);
         assert_eq!(lit_edge(100.0), theme::week_bar_w());
+    }
+
+    #[test]
+    fn multi_provider_dynamic_expansion() {
+        let notch_h = 32.0;
+        let snap = Snapshot {
+            five_hour: Some(Limit { used: 30.0, resets_at: Some(usage::now() + 3600) }),
+            seven_day: Some(Limit { used: 40.0, resets_at: None }),
+            ..Default::default()
+        };
+        let ear_claude = ProviderEar::new(Provider::Claude, Some(&snap), notch_h, false);
+        let ear_antigravity = ProviderEar::new(Provider::Antigravity, Some(&snap), notch_h, false);
+
+        let single_w = theme::EAR_OUTER + ear_claude.content_w + theme::EAR_INNER;
+        let both_w = theme::EAR_OUTER + ear_claude.content_w + PROVIDER_GAP + ear_antigravity.content_w + theme::EAR_INNER;
+
+        assert!(both_w > single_w);
+        assert_eq!(both_w, single_w + PROVIDER_GAP + ear_antigravity.content_w);
+    }
+
+    #[test]
+    fn provider_rows_distinction() {
+        let snap = Snapshot {
+            five_hour: Some(Limit { used: 10.0, resets_at: None }),
+            seven_day: Some(Limit { used: 20.0, resets_at: None }),
+            seven_day_opus: Some(Limit { used: 15.0, resets_at: None }),
+            seven_day_sonnet: Some(Limit { used: 25.0, resets_at: None }),
+            ..Default::default()
+        };
+        let c_rows = rows_for(Provider::Claude, &snap);
+        let a_rows = rows_for(Provider::Antigravity, &snap);
+
+        assert_eq!(c_rows.len(), 4);
+        assert_eq!(c_rows[2].0, "Opus");
+        assert_eq!(c_rows[3].0, "Sonnet");
+
+        assert_eq!(a_rows.len(), 2);
+        assert_eq!(a_rows[0].0, "Session");
+        assert_eq!(a_rows[1].0, "Weekly");
+    }
+
+    #[test]
+    fn test_antigravity_pixel_table() {
+        assert_eq!(ANTIGRAVITY_PIXELS.len(), 50);
+        for &(px, py, hex) in ANTIGRAVITY_PIXELS {
+            assert!(px >= 0.0 && px <= 11.0, "px out of range: {px}");
+            assert!(py >= 0.0 && py <= 9.0, "py out of range: {py}");
+            assert!(hex <= 0xFFFFFF, "invalid hex color: {hex:#x}");
+        }
     }
 }

@@ -38,6 +38,8 @@ pub fn readme_frames(mtm: MainThreadMarker, dir: &str) {
 
     let view = NotchView::new(mtm, CAShapeLayer::new());
     view.ivars().notch_h.set(NOTCH_H);
+    view.ivars().show_claude.set(true);
+    view.ivars().show_antigravity.set(true);
 
     // Collapsed: one frame per 1/FPS through the script.
     let base = CACurrentMediaTime();
@@ -48,11 +50,12 @@ pub fn readme_frames(mtm: MainThreadMarker, dir: &str) {
         while t < end {
             CLOCK.with(|c| c.set(Some(base + t)));
             usage::set_snapshot(snap(week_left));
+            usage::set_snapshot_for(usage::Provider::Antigravity, snap(week_left));
             let iv = view.ivars();
             // What the periodic tick would do: blink now and then, tremble bursts.
             iv.blink.set(t % 2.7 < 0.12);
             if t % 2.0 < 1.0 / FPS {
-                iv.tremble_until.set(base + t + theme::TREMBLE_BURST);
+                iv.claude_char.tremble_until.set(base + t + theme::TREMBLE_BURST);
             }
             let image = collapsed_frame(&view, week_left);
             save_png(&image, &format!("{dir}/frames/{frame:04}.png"));
@@ -65,15 +68,18 @@ pub fn readme_frames(mtm: MainThreadMarker, dir: &str) {
     CLOCK.with(|c| c.set(None));
     let s = snap(59.0);
     let start = now - (5 * 3600 - (2 * 3600 + 13 * 60));
-    let samples = (0..=((now - start) / 300))
+    let samples: Vec<usage::Sample> = (0..=((now - start) / 300))
         .map(|i| {
             let k = i as f64 * 300.0 / (now - start) as f64;
             let wiggle = ((i as f64) * 1.7).sin() * 1.5;
             usage::Sample { t: start + i * 300, session: (2.0 + 26.0 * k.powf(1.3) + wiggle).max(0.0) as f32 }
         })
         .collect();
-    usage::set_history(samples);
+    usage::set_history(samples.clone());
+    usage::set_history_for(usage::Provider::Antigravity, samples);
     usage::set_snapshot(s.clone());
+    usage::set_snapshot_for(usage::Provider::Antigravity, s.clone());
+    view.ivars().show_antigravity.set(true);
     let image = expanded_frame(&view, &s);
     save_png(&image, &format!("{dir}/expanded.png"));
     println!("rendered {frame} frames + expanded.png into {dir}");
@@ -100,8 +106,7 @@ fn notch_rect(size: NSSize) -> NSRect {
 
 fn collapsed_frame(view: &NotchView, week_left: f64) -> Retained<NSImage> {
     let size = NSSize::new(CANVAS_W, NOTCH_H + 14.0);
-    let ears = Ears::new(usage::snapshot().as_ref(), NOTCH_H, false);
-    let (lw, _) = ears.widths();
+    let lw = view.total_left_width(NOTCH_H);
     let notch = notch_rect(size);
     let blob = NSRect::new(
         pt(notch.origin.x - FLARE - lw, notch.origin.y),
@@ -121,12 +126,11 @@ fn collapsed_frame(view: &NotchView, week_left: f64) -> Retained<NSImage> {
     })
 }
 
-fn expanded_frame(view: &NotchView, snap: &Snapshot) -> Retained<NSImage> {
-    let ears = Ears::new(Some(snap), NOTCH_H, false);
-    let (lw, _) = ears.widths();
-    let rows = rows(snap).len().max(1) as f64;
+fn expanded_frame(view: &NotchView, _snap: &Snapshot) -> Retained<NSImage> {
+    let lw = view.total_left_width(NOTCH_H);
+    let active = view.active_providers();
     let ew = (NOTCH_W + 2.0 * FLARE + 2.0 * lw).max(EXPANDED_W);
-    let eh = expanded_height(NOTCH_H, rows);
+    let eh = multi_expanded_height(NOTCH_H, &active);
     let size = NSSize::new(CANVAS_W.max(ew + 60.0), eh + 30.0);
     let panel = NSRect::new(pt((size.width - ew) / 2.0, size.height - eh), NSSize::new(ew, eh));
     let iv = view.ivars();

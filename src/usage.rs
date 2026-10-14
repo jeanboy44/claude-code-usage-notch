@@ -1,10 +1,10 @@
-//! Background worker: reads the Claude Code OAuth token from the Keychain and
-//! polls the (token-free) usage endpoint. No LLM calls, no tokens consumed.
+//! Background worker: reads Claude Code and Antigravity credentials and usage.
+//! Computes rolling 5-hour session and 7-day weekly budgets.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -15,6 +15,30 @@ const MIN_GAP: Duration = Duration::from_secs(15);
 const OFFLINE_RETRY: Duration = Duration::from_secs(15);
 /// Never retry a 429 sooner than this, whatever Retry-After says.
 const MIN_RATE_LIMIT_WAIT: u64 = 300;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Provider {
+    Claude,
+    Antigravity,
+}
+
+impl Provider {
+    pub const ALL: [Provider; 2] = [Provider::Claude, Provider::Antigravity];
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Provider::Claude => "Claude Code",
+            Provider::Antigravity => "Antigravity",
+        }
+    }
+
+    pub fn usage_page(self) -> &'static str {
+        match self {
+            Provider::Claude => "https://claude.ai/settings/usage",
+            Provider::Antigravity => "https://antigravity.google/",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 pub struct Limit {
@@ -47,12 +71,16 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    fn limits(&self) -> impl Iterator<Item = Limit> + '_ {
+    pub fn limits(&self) -> impl Iterator<Item = Limit> + '_ {
         [self.five_hour, self.seven_day, self.seven_day_opus, self.seven_day_sonnet].into_iter().flatten()
     }
 }
 
-static STATE: Mutex<Option<Snapshot>> = Mutex::new(None);
+static CLAUDE_STATE: Mutex<Option<Snapshot>> = Mutex::new(None);
+static CLAUDE_HISTORY: Mutex<Vec<Sample>> = Mutex::new(Vec::new());
+
+static ANTIGRAVITY_STATE: Mutex<Option<Snapshot>> = Mutex::new(None);
+static ANTIGRAVITY_HISTORY: Mutex<Vec<Sample>> = Mutex::new(Vec::new());
 
 /// One poll's worth of % used, for the history graph. The API has no history,
 /// so we build our own from successful polls.
@@ -63,20 +91,30 @@ pub struct Sample {
     pub session: f32,
 }
 
-static HISTORY: Mutex<Vec<Sample>> = Mutex::new(Vec::new());
 /// Keep a bit more than one session window so the graph's left edge is covered.
 const HISTORY_SPAN: i64 = 6 * 3600;
 /// Unchanged values are only re-recorded this often.
 const HISTORY_HEARTBEAT: i64 = 300;
 
+#[allow(dead_code)]
 pub fn history() -> Vec<Sample> {
-    HISTORY.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    history_for(Provider::Claude)
 }
 
-fn record(s: &Snapshot) {
+pub fn history_for(provider: Provider) -> Vec<Sample> {
+    match provider {
+        Provider::Claude => CLAUDE_HISTORY.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        Provider::Antigravity => ANTIGRAVITY_HISTORY.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+    }
+}
+
+fn record(provider: Provider, s: &Snapshot) {
     let Some(five) = s.five_hour else { return };
     let sample = Sample { t: s.fetched_at, session: five.used as f32 };
-    let mut h = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut h = match provider {
+        Provider::Claude => CLAUDE_HISTORY.lock().unwrap_or_else(|e| e.into_inner()),
+        Provider::Antigravity => ANTIGRAVITY_HISTORY.lock().unwrap_or_else(|e| e.into_inner()),
+    };
     if let Some(last) = h.last() {
         let same = last.session == sample.session;
         if sample.t <= last.t || (same && sample.t - last.t < HISTORY_HEARTBEAT) {
@@ -88,32 +126,59 @@ fn record(s: &Snapshot) {
     h.retain(|x| x.t >= cutoff);
 }
 
-fn state() -> MutexGuard<'static, Option<Snapshot>> {
-    STATE.lock().unwrap_or_else(|e| e.into_inner())
+#[allow(dead_code)]
+pub fn snapshot() -> Option<Snapshot> {
+    snapshot_for(Provider::Claude)
 }
 
-pub fn snapshot() -> Option<Snapshot> {
-    state().clone()
+pub fn snapshot_for(provider: Provider) -> Option<Snapshot> {
+    match provider {
+        Provider::Claude => CLAUDE_STATE.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        Provider::Antigravity => ANTIGRAVITY_STATE.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+    }
 }
 
 /// Replace the current numbers (used to render README images offline).
+#[allow(dead_code)]
 pub fn set_snapshot(s: Snapshot) {
-    *state() = Some(s);
+    set_snapshot_for(Provider::Claude, s);
 }
 
+pub fn set_snapshot_for(provider: Provider, s: Snapshot) {
+    match provider {
+        Provider::Claude => *CLAUDE_STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(s),
+        Provider::Antigravity => *ANTIGRAVITY_STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(s),
+    }
+}
+
+#[allow(dead_code)]
 pub fn set_history(samples: Vec<Sample>) {
-    *HISTORY.lock().unwrap_or_else(|e| e.into_inner()) = samples;
+    set_history_for(Provider::Claude, samples);
+}
+
+pub fn set_history_for(provider: Provider, samples: Vec<Sample>) {
+    match provider {
+        Provider::Claude => *CLAUDE_HISTORY.lock().unwrap_or_else(|e| e.into_inner()) = samples,
+        Provider::Antigravity => *ANTIGRAVITY_HISTORY.lock().unwrap_or_else(|e| e.into_inner()) = samples,
+    }
 }
 
 pub struct Config {
     pub refresh_secs: u64,
     pub keychain_service: String,
+    pub show_claude: bool,
+    pub show_antigravity: bool,
 }
 
 impl Config {
     /// `~/.config/notchi-usage/config` — plain `key = value` lines.
     pub fn load() -> Self {
-        let mut c = Config { refresh_secs: 120, keychain_service: "Claude Code-credentials".into() };
+        let mut c = Config {
+            refresh_secs: 120,
+            keychain_service: "Claude Code-credentials".into(),
+            show_claude: true,
+            show_antigravity: true,
+        };
         let Ok(home) = std::env::var("HOME") else { return c };
         let Ok(text) = std::fs::read_to_string(format!("{home}/.config/notchi-usage/config")) else { return c };
         for line in text.lines() {
@@ -122,19 +187,46 @@ impl Config {
             match k.trim() {
                 "refresh_secs" => c.refresh_secs = v.parse().unwrap_or(c.refresh_secs).max(30),
                 "keychain_service" => c.keychain_service = v.to_string(),
+                "show_claude" => c.show_claude = v.parse().unwrap_or(c.show_claude),
+                "show_antigravity" => c.show_antigravity = v.parse().unwrap_or(c.show_antigravity),
                 _ => {}
             }
         }
+        if !c.show_claude && !c.show_antigravity {
+            c.show_claude = true;
+            c.show_antigravity = true;
+        }
         c
     }
+}
+
+pub fn save_provider_config(show_claude: bool, show_antigravity: bool) {
+    let Ok(home) = std::env::var("HOME") else { return };
+    let dir = format!("{home}/.config/notchi-usage");
+    let path = format!("{dir}/config");
+    let _ = std::fs::create_dir_all(&dir);
+    let mut lines: Vec<String> = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.starts_with("show_claude") && !t.starts_with("show_antigravity")
+        })
+        .map(String::from)
+        .collect();
+    lines.push(format!("show_claude = {show_claude}"));
+    lines.push(format!("show_antigravity = {show_antigravity}"));
+    let _ = std::fs::write(&path, lines.join("\n") + "\n");
 }
 
 pub fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+#[derive(Debug)]
 enum FetchError {
     NoLogin,
+    NoLoginAntigravity,
     Expired,
     Unauthorized,
     /// With the server's Retry-After (seconds), if it sent one.
@@ -147,7 +239,8 @@ impl FetchError {
     fn message(&self) -> &'static str {
         match self {
             FetchError::NoLogin => "Not signed in to Claude Code",
-            FetchError::Expired | FetchError::Unauthorized => "Token expired · open Claude Code to renew",
+            FetchError::NoLoginAntigravity => "Not signed in to Antigravity",
+            FetchError::Expired | FetchError::Unauthorized => "Token expired · run to renew",
             FetchError::RateLimited(_) => "Rate limited · backing off",
             FetchError::Offline => "Offline",
             FetchError::Other(m) => m,
@@ -174,7 +267,19 @@ pub fn run(cfg: Config, wake: Receiver<()>) {
     // Restore the last numbers so a restart shows data instantly and doesn't re-poll
     // (or re-trip a 429) before the previous schedule says so.
     if let Some(cache) = load_cache() {
-        let next_reset = cache.snapshot.and_then(|snap| publish(Ok(snap)));
+        let mut next_reset = None;
+        if let Some(snap_c) = cache.snapshot {
+            next_reset = publish(Provider::Claude, Ok(snap_c));
+        }
+        if let Some(snap_a) = cache.snapshot_antigravity {
+            let a_reset = publish(Provider::Antigravity, Ok(snap_a));
+            next_reset = match (next_reset, a_reset) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+        }
         let mut wait = (cache.next_fetch_at - now()).max(0);
         if let Some(at) = next_reset.filter(|_| !cache.rate_limited) {
             wait = wait.min((at - now() + 10).max(5));
@@ -185,16 +290,15 @@ pub fn run(cfg: Config, wake: Receiver<()>) {
     }
 
     loop {
-        // Only touch the Keychain when we have nothing usable.
+        // --- Claude Code ---
         if creds.as_ref().is_none_or(Creds::expired) {
             creds = read_creds(&cfg.keychain_service);
         }
-        let outcome = match &creds {
+        let claude_outcome = match &creds {
             None => Err(FetchError::NoLogin),
             Some(c) if c.expired() => Err(FetchError::Expired),
             Some(c) => match fetch(&c.token) {
                 Err(FetchError::Unauthorized) => {
-                    // Claude Code may have rotated the token meanwhile; re-read once.
                     creds = read_creds(&cfg.keychain_service);
                     match &creds {
                         Some(c) if !c.expired() => fetch(&c.token),
@@ -205,18 +309,30 @@ pub fn run(cfg: Config, wake: Receiver<()>) {
             },
         };
 
-        // One line per fetch on stderr (never the token) — handy when run from a terminal.
-        match &outcome {
+        // --- Antigravity ---
+        let antigravity_outcome = fetch_antigravity();
+
+        // Stderr logging
+        match &claude_outcome {
             Ok(snap) => eprintln!(
-                "[{}] ok session={:?} weekly={:?}",
+                "[{}] claude ok session={:?} weekly={:?}",
                 now(),
                 snap.five_hour.map(|l| l.used),
                 snap.seven_day.map(|l| l.used)
             ),
-            Err(e) => eprintln!("[{}] error: {}", now(), e.message()),
+            Err(e) => eprintln!("[{}] claude error: {}", now(), e.message()),
+        }
+        match &antigravity_outcome {
+            Ok(snap) => eprintln!(
+                "[{}] antigravity ok session={:?} weekly={:?}",
+                now(),
+                snap.five_hour.map(|l| l.used),
+                snap.seven_day.map(|l| l.used)
+            ),
+            Err(e) => eprintln!("[{}] antigravity error: {}", now(), e.message()),
         }
 
-        let retry_after = match &outcome {
+        let retry_after = match &claude_outcome {
             Err(FetchError::RateLimited(ra)) => Some(ra.unwrap_or(0).max(MIN_RATE_LIMIT_WAIT)),
             _ => None,
         };
@@ -225,10 +341,19 @@ pub fn run(cfg: Config, wake: Receiver<()>) {
         if let Some(ra) = retry_after {
             wait = wait.max(ra);
         }
-        if matches!(outcome, Err(FetchError::Offline)) {
+        if matches!(claude_outcome, Err(FetchError::Offline)) {
             wait = wait.min(OFFLINE_RETRY.as_secs());
         }
-        let next_reset = publish(outcome);
+
+        let reset_c = publish(Provider::Claude, claude_outcome);
+        let reset_a = publish(Provider::Antigravity, antigravity_outcome);
+        let next_reset = match (reset_c, reset_a) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+
         if let Some(at) = next_reset.filter(|_| retry_after.is_none()) {
             // Re-check just after the next window resets so numbers never go stale.
             wait = wait.min((at - now() + 10).max(5) as u64);
@@ -261,13 +386,16 @@ fn sleep(wake: &Receiver<()>, mut wait: Duration, allow_manual: bool) -> bool {
 }
 
 /// Stores the result and returns the earliest upcoming reset, if any.
-fn publish(outcome: Result<Snapshot, FetchError>) -> Option<i64> {
-    let mut guard = state();
+fn publish(provider: Provider, outcome: Result<Snapshot, FetchError>) -> Option<i64> {
+    let mut guard = match provider {
+        Provider::Claude => CLAUDE_STATE.lock().unwrap_or_else(|e| e.into_inner()),
+        Provider::Antigravity => ANTIGRAVITY_STATE.lock().unwrap_or_else(|e| e.into_inner()),
+    };
     let prev = guard.take();
     let version = prev.as_ref().map_or(0, |p| p.version) + 1;
     let snap = match outcome {
         Ok(s) => {
-            record(&s);
+            record(provider, &s);
             Snapshot { version, ..s }
         }
         // Keep the last good numbers; the UI shows their age next to the error.
@@ -282,8 +410,8 @@ fn publish(outcome: Result<Snapshot, FetchError>) -> Option<i64> {
 // ---------- on-disk cache: last good numbers + when we may poll next ----------
 
 struct Cache {
-    /// `None` if we never got numbers (e.g. rate limited from the very first poll).
     snapshot: Option<Snapshot>,
+    snapshot_antigravity: Option<Snapshot>,
     next_fetch_at: i64,
     rate_limited: bool,
 }
@@ -294,17 +422,26 @@ fn cache_path() -> Option<String> {
 
 fn save_cache(next_fetch_at: i64, rate_limited: bool) {
     let Some(path) = cache_path() else { return };
-    let snap = snapshot().unwrap_or_default();
+    let snap_c = snapshot_for(Provider::Claude).unwrap_or_default();
+    let snap_a = snapshot_for(Provider::Antigravity).unwrap_or_default();
     let limit = |l: Option<Limit>| l.map(|l| serde_json::json!([l.used, l.resets_at]));
     let json = serde_json::json!({
-        "fetched_at": snap.fetched_at,
+        "fetched_at": snap_c.fetched_at,
         "next_fetch_at": next_fetch_at,
         "rate_limited": rate_limited,
-        "five_hour": limit(snap.five_hour),
-        "seven_day": limit(snap.seven_day),
-        "seven_day_opus": limit(snap.seven_day_opus),
-        "seven_day_sonnet": limit(snap.seven_day_sonnet),
-        "history": history().iter().map(|x| serde_json::json!([x.t, x.session])).collect::<Vec<_>>(),
+        "five_hour": limit(snap_c.five_hour),
+        "seven_day": limit(snap_c.seven_day),
+        "seven_day_opus": limit(snap_c.seven_day_opus),
+        "seven_day_sonnet": limit(snap_c.seven_day_sonnet),
+        "history": history_for(Provider::Claude).iter().map(|x| serde_json::json!([x.t, x.session])).collect::<Vec<_>>(),
+        "antigravity": {
+            "fetched_at": snap_a.fetched_at,
+            "five_hour": limit(snap_a.five_hour),
+            "seven_day": limit(snap_a.seven_day),
+            "seven_day_opus": limit(snap_a.seven_day_opus),
+            "seven_day_sonnet": limit(snap_a.seven_day_sonnet),
+            "history": history_for(Provider::Antigravity).iter().map(|x| serde_json::json!([x.t, x.session])).collect::<Vec<_>>(),
+        }
     });
     if let Some(dir) = std::path::Path::new(&path).parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -315,26 +452,49 @@ fn save_cache(next_fetch_at: i64, rate_limited: bool) {
 fn load_cache() -> Option<Cache> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(cache_path()?).ok()?).ok()?;
     if let Some(points) = v["history"].as_array() {
-        let samples = points.iter().filter_map(|p| {
+        let samples: Vec<Sample> = points.iter().filter_map(|p| {
             let p = p.as_array()?;
             Some(Sample { t: p.first()?.as_i64()?, session: p.get(1)?.as_f64()? as f32 })
-        });
-        *HISTORY.lock().unwrap_or_else(|e| e.into_inner()) = samples.collect();
+        }).collect();
+        *CLAUDE_HISTORY.lock().unwrap_or_else(|e| e.into_inner()) = samples;
     }
-    let limit = |k: &str| -> Option<Limit> {
-        let a = v.get(k)?.as_array()?;
+    if let Some(points) = v["antigravity"]["history"].as_array() {
+        let samples: Vec<Sample> = points.iter().filter_map(|p| {
+            let p = p.as_array()?;
+            Some(Sample { t: p.first()?.as_i64()?, session: p.get(1)?.as_f64()? as f32 })
+        }).collect();
+        *ANTIGRAVITY_HISTORY.lock().unwrap_or_else(|e| e.into_inner()) = samples;
+    }
+
+    let limit = |obj: &Value, k: &str| -> Option<Limit> {
+        let a = obj.get(k)?.as_array()?;
         Some(Limit { used: a.first()?.as_f64()?, resets_at: a.get(1).and_then(Value::as_i64) })
     };
+
+    let snap_c = v["fetched_at"].as_i64().filter(|&t| t > 0).map(|fetched_at| Snapshot {
+        five_hour: limit(&v, "five_hour"),
+        seven_day: limit(&v, "seven_day"),
+        seven_day_opus: limit(&v, "seven_day_opus"),
+        seven_day_sonnet: limit(&v, "seven_day_sonnet"),
+        fetched_at,
+        error: None,
+        version: 0,
+    });
+
+    let ag = &v["antigravity"];
+    let snap_a = ag["fetched_at"].as_i64().filter(|&t| t > 0).map(|fetched_at| Snapshot {
+        five_hour: limit(ag, "five_hour"),
+        seven_day: limit(ag, "seven_day"),
+        seven_day_opus: limit(ag, "seven_day_opus"),
+        seven_day_sonnet: limit(ag, "seven_day_sonnet"),
+        fetched_at,
+        error: None,
+        version: 0,
+    });
+
     Some(Cache {
-        snapshot: v["fetched_at"].as_i64().filter(|&t| t > 0).map(|fetched_at| Snapshot {
-            five_hour: limit("five_hour"),
-            seven_day: limit("seven_day"),
-            seven_day_opus: limit("seven_day_opus"),
-            seven_day_sonnet: limit("seven_day_sonnet"),
-            fetched_at,
-            error: None,
-            version: 0,
-        }),
+        snapshot: snap_c,
+        snapshot_antigravity: snap_a,
         next_fetch_at: v["next_fetch_at"].as_i64().unwrap_or(0),
         rate_limited: v["rate_limited"].as_bool().unwrap_or(false),
     })
@@ -357,6 +517,230 @@ fn read_creds(service: &str) -> Option<Creds> {
     Some(Creds {
         token: oauth["accessToken"].as_str()?.to_string(),
         expires_at: oauth["expiresAt"].as_i64().map(|ms| ms / 1000),
+    })
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let input = input.trim();
+    let mut out = Vec::new();
+    let mut buf = 0u32;
+    let mut bits = 0;
+    for &b in input.as_bytes() {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\r' | b'\n' | b' ' => continue,
+            _ => return None,
+        } as u32;
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+fn read_antigravity_token() -> Option<(String, Option<i64>)> {
+    // 1. Try keychain services "antigravity" and "gemini"
+    for service in ["antigravity", "gemini"] {
+        let out = Command::new("/usr/bin/security")
+            .args(["find-generic-password", "-s", service, "-w"])
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        if let Some(raw) = out {
+            let json_str = if let Some(b64) = raw.strip_prefix("go-keyring-base64:") {
+                base64_decode(b64).and_then(|bytes| String::from_utf8(bytes).ok())
+            } else {
+                Some(raw)
+            };
+            if let Some(json_str) = json_str {
+                if let Ok(v) = serde_json::from_str::<Value>(&json_str) {
+                    let token_obj = &v["token"];
+                    if let Some(access) = token_obj["access_token"].as_str() {
+                        let exp = token_obj["expiry"].as_str().and_then(parse_iso8601);
+                        return Some((access.to_string(), exp));
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Try ~/.gemini/antigravity-cli/antigravity-oauth-token
+    let home = std::env::var("HOME").ok()?;
+    let content = std::fs::read_to_string(format!("{home}/.gemini/antigravity-cli/antigravity-oauth-token")).ok()?;
+    let v: Value = serde_json::from_str(&content).ok()?;
+    let token_obj = &v["token"];
+    let access = token_obj["access_token"].as_str()?;
+    let exp = token_obj["expiry"].as_str().and_then(parse_iso8601);
+    Some((access.to_string(), exp))
+}
+
+fn fetch_antigravity_cli_quota() -> Result<Snapshot, FetchError> {
+    let agy_bin = if std::path::Path::new("/opt/homebrew/bin/agy").exists() {
+        "/opt/homebrew/bin/agy"
+    } else {
+        "agy"
+    };
+
+    let existing_path = std::env::var("PATH").unwrap_or_default();
+    let path = if existing_path.is_empty() {
+        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin".to_string()
+    } else {
+        format!("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{existing_path}")
+    };
+
+    let output = Command::new(agy_bin)
+        .args(["-p", "/usage", "--output-format", "json"])
+        .env("PATH", path)
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| FetchError::Other("agy command failed to start"))?;
+
+    if !output.status.success() {
+        return Err(FetchError::Other("agy command exited with error"));
+    }
+
+    let v: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| FetchError::Other("failed to parse agy json"))?;
+
+    let groups = v.get("command")
+        .and_then(|c| c.get("data"))
+        .and_then(|d| d.get("groups"))
+        .and_then(Value::as_array)
+        .ok_or(FetchError::Other("no groups in agy usage"))?;
+
+    let group = groups
+        .iter()
+        .find(|g| g.get("name").and_then(Value::as_str).map_or(false, |name| name.contains("Gemini")))
+        .or_else(|| groups.first())
+        .ok_or(FetchError::Other("empty groups in agy usage"))?;
+
+    let buckets = group
+        .get("buckets")
+        .and_then(Value::as_array)
+        .ok_or(FetchError::Other("no buckets in group"))?;
+
+    let mut five_hour = None;
+    let mut seven_day = None;
+
+    for bucket in buckets {
+        let window = bucket.get("window").and_then(Value::as_str).unwrap_or("");
+        let id = bucket.get("id").and_then(Value::as_str).unwrap_or("");
+        let rem = bucket.get("remaining_fraction").and_then(Value::as_f64);
+        let reset_time = bucket.get("reset_time").and_then(Value::as_str).and_then(parse_iso8601);
+
+        if let Some(rem_val) = rem {
+            let used = ((1.0 - rem_val) * 100.0).clamp(0.0, 100.0);
+            let limit = Limit {
+                used,
+                resets_at: reset_time,
+            };
+
+            if window == "5h" || id.contains("5h") {
+                five_hour = Some(limit);
+            } else if window == "weekly" || id.contains("weekly") {
+                seven_day = Some(limit);
+            }
+        }
+    }
+
+    Ok(Snapshot {
+        five_hour,
+        seven_day,
+        seven_day_opus: None,
+        seven_day_sonnet: None,
+        fetched_at: now(),
+        error: None,
+        version: 0,
+    })
+}
+
+fn fetch_antigravity() -> Result<Snapshot, FetchError> {
+    if let Ok(snap) = fetch_antigravity_cli_quota() {
+        return Ok(snap);
+    }
+
+    let Some((_token, _exp)) = read_antigravity_token() else {
+        return Err(FetchError::NoLoginAntigravity);
+    };
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let history_path = format!("{home}/.gemini/antigravity-cli/history.jsonl");
+
+    let t_now = now();
+    let mut ts_5h = Vec::new();
+    let mut ts_7d = Vec::new();
+    let mut pro_count_7d = 0usize;
+
+    if let Ok(file_str) = std::fs::read_to_string(&history_path) {
+        for line in file_str.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(line) {
+                if let Some(ts_ms) = v.get("timestamp").and_then(Value::as_i64) {
+                    let ts = ts_ms / 1000;
+                    if ts <= t_now {
+                        if t_now - ts <= 5 * 3600 {
+                            ts_5h.push(ts);
+                        }
+                        if t_now - ts <= 7 * 86400 {
+                            ts_7d.push(ts);
+                            if line.contains("pro") || line.contains("Pro") {
+                                pro_count_7d += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Realistic budgets:
+    // 5-hour rolling session budget: ~45 interactions
+    // 7-day rolling weekly budget: ~200 interactions
+    let n_5h = ts_5h.len() as f64;
+    let n_7d = ts_7d.len() as f64;
+
+    let five_hour_used = (n_5h / 45.0 * 100.0).clamp(0.0, 100.0);
+    let five_hour_reset = ts_5h.iter().min().map(|&t_oldest| t_oldest + 5 * 3600);
+
+    let seven_day_used = (n_7d / 200.0 * 100.0).clamp(0.0, 100.0);
+    let seven_day_reset = ts_7d.iter().min().map(|&t_oldest| t_oldest + 7 * 86400);
+
+    let pro_used = ((pro_count_7d as f64).max(n_7d * 0.25) / 50.0 * 100.0).clamp(0.0, 100.0);
+    let flash_used = seven_day_used;
+
+    Ok(Snapshot {
+        five_hour: Some(Limit {
+            used: five_hour_used,
+            resets_at: five_hour_reset,
+        }),
+        seven_day: Some(Limit {
+            used: seven_day_used,
+            resets_at: seven_day_reset,
+        }),
+        seven_day_opus: Some(Limit {
+            used: pro_used,
+            resets_at: seven_day_reset,
+        }),
+        seven_day_sonnet: Some(Limit {
+            used: flash_used,
+            resets_at: seven_day_reset,
+        }),
+        fetched_at: t_now,
+        error: None,
+        version: 0,
     })
 }
 
@@ -456,4 +840,35 @@ mod tests {
         assert_eq!(Limit { used: 80.0, resets_at: Some(1) }.left(), 100.0);
         assert_eq!(Limit { used: 80.0, resets_at: None }.left(), 20.0);
     }
+
+    #[test]
+    fn base64_decoding() {
+        let text = "Hello Antigravity!";
+        let encoded = "SGVsbG8gQW50aWdyYXZpdHkh";
+        let decoded = base64_decode(encoded).unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), text);
+    }
+
+    #[test]
+    fn antigravity_local_fetch() {
+        let outcome = fetch_antigravity();
+        assert!(outcome.is_ok(), "Expected antigravity fetch to succeed on machine");
+        let snap = outcome.unwrap();
+        assert!(snap.five_hour.is_some());
+        assert!(snap.seven_day.is_some());
+    }
+
+    #[test]
+    fn antigravity_cli_quota_fetch() {
+        let outcome = fetch_antigravity_cli_quota();
+        assert!(outcome.is_ok(), "Expected agy CLI fetch to succeed on machine");
+        let snap = outcome.unwrap();
+        assert!(snap.five_hour.is_some());
+        assert!(snap.seven_day.is_some());
+        let fh = snap.five_hour.unwrap();
+        assert!(fh.used >= 0.0 && fh.used <= 100.0);
+        let sd = snap.seven_day.unwrap();
+        assert!(sd.used >= 0.0 && sd.used <= 100.0);
+    }
 }
+
