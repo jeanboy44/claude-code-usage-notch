@@ -40,6 +40,9 @@ pub const TEXT_TERTIARY: Color = CLOUD.alpha(0.75); // ≥ 4.5:1 on black
 pub const TRACK: Color = IVORY.alpha(0.12);
 pub const CLAWD: Color = CLAUDE_ORANGE;
 pub const CLAWD_EYE: Color = BLACK;
+#[allow(dead_code)]
+pub const ANTIGRAVITY: Color = Color::hex(0x4E88F5);
+pub const ANTIGRAVITY_EYE: Color = BLACK;
 pub const SWEAT: Color = DUSTY_BLUE;
 
 /// Band floors (% left) shared by colours and Clawd's stance.
@@ -132,6 +135,6 @@ pub const GRAPH_NOW: Color = IVORY.alpha(0.35);
 pub const GRAPH_AXIS_H: f64 = 16.0;
 pub const BAR_H: f64 = 7.0;
 // row columns, measured from the content edges
-pub const COL_BAR_X: f64 = 48.0; // from left
+pub const COL_BAR_X: f64 = 56.0; // from left
 pub const COL_PCT_R: f64 = 150.0; // % right edge, from right
 pub const COL_BAR_END: f64 = 196.0; // bar end, from right
