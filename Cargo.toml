@@ -1,6 +1,6 @@
 [package]
 name = "notchi-usage"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "A tiny, cute Claude usage meter living in the MacBook notch"
 
@@ -26,6 +26,11 @@ objc2-quartz-core = { version = "0.3", default-features = false, features = [
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGPath", "CGColor"] }
 serde_json = "1"
 objc2-service-management = { version = "0.3", default-features = false, features = ["std", "objc2", "SMAppService", "objc2-foundation"] }
+aes = "0.8"
+cbc = "0.1"
+pbkdf2 = "0.12"
+sha1 = "0.10"
+security-framework = "3"
 
 [profile.release]
 opt-level = "s"

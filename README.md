@@ -21,7 +21,7 @@ A tiny, cute usage meter for Claude Code and Google Antigravity that lives in yo
 
 ## Data & token cost
 
-- **Claude Code**: Notchi reads the OAuth token that Claude Code stores in the macOS Keychain (`Claude Code-credentials`) and calls `https://api.anthropic.com/api/oauth/usage`. That endpoint is not a model call, so it costs **zero tokens**. The token is only read, never refreshed, so your Claude Code session is untouched. The first launch shows a Keychain prompt — choose "Always Allow". If the token expires, just open Claude Code once and it refreshes. The token is passed to curl via stdin, so it never shows up in `ps`.
+- **Claude Code**: Notchi reads the OAuth token that Claude Code stores in the macOS Keychain (`Claude Code-credentials`) and calls `https://api.anthropic.com/api/oauth/usage`. That endpoint is not a model call, so it costs **zero tokens**. The token is only read, never refreshed, so your Claude Code session is untouched. The first launch shows a Keychain prompt — choose "Always Allow". If the token expires, just open Claude Code once and it refreshes. **Claude desktop app only?** If there is no usable Claude Code login, Notchi falls back to the desktop app's sign-in: it decrypts the token in `~/Library/Application Support/Claude/config.json` with the "Claude Safe Storage" Keychain key (read-only; the app refreshes its own tokens) and uses it for the same usage call. The token is passed to curl via stdin, so it never shows up in `ps`.
 - **Google Antigravity**: Notchi reads usage information via the Antigravity CLI (`agy -p "/usage" --output-format json`) or local quota cache (`~/.gemini/antigravity-cli/antigravity-usage.json`) to track Gemini quota in real-time.
 
 ## Install
@@ -39,9 +39,10 @@ Apple Silicon, macOS 14+. To start it automatically, right-click the notch → *
 | What you'll see | Why | What to do |
 |---|---|---|
 | "NotchiUsage can't be opened / unidentified developer" | The app is ad-hoc signed, not notarized by Apple | Right-click → Open once, or `xattr -dr com.apple.quarantine /Applications/NotchiUsage.app` |
-| "security wants to use your confidential information stored in 'Claude Code-credentials'" | Notchi reads Claude Code's login token (read-only) via Apple's `/usr/bin/security` tool | Enter your Mac password and choose **Always Allow** — it won't ask again, even after updates |
+| "NotchiUsage wants to use your confidential information stored in 'Claude Code-credentials'" | Notchi reads Claude Code's login token (read-only) straight from the Keychain | Enter your Mac password and choose **Always Allow**. The grant is for NotchiUsage only; it may ask once more after an update because the app is ad-hoc signed |
+| "NotchiUsage wants to use your confidential information stored in 'Claude Safe Storage'" (only when Claude Code has no valid login) | Notchi reads the Claude desktop app's login token (read-only) to show your usage | Enter your Mac password and choose **Always Allow**. Like the row above, the grant applies to NotchiUsage only, not to other programs |
 
-That's all. No Accessibility, Screen Recording, Full Disk Access or other permissions are needed. To revoke access later, open Keychain Access → `Claude Code-credentials` → Access Control and remove `security`.
+That's all. No Accessibility, Screen Recording, Full Disk Access or other permissions are needed. To revoke access later, open Keychain Access → `Claude Code-credentials` → Access Control and remove `NotchiUsage`. Same for `Claude Safe Storage`.
 
 ## Build from source
 

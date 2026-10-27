@@ -6,7 +6,8 @@ cargo build --release
 APP=dist/NotchiUsage.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/notchi-usage "$APP/Contents/MacOS/"
+# The executable name is what Keychain prompts show ("NotchiUsage wants to use ...").
+cp target/release/notchi-usage "$APP/Contents/MacOS/NotchiUsage"
 cp assets/AppIcon.icns "$APP/Contents/Resources/"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -15,10 +16,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <dict>
   <key>CFBundleName</key><string>NotchiUsage</string>
   <key>CFBundleIdentifier</key><string>dev.local.notchi-usage</string>
-  <key>CFBundleExecutable</key><string>notchi-usage</string>
+  <key>CFBundleExecutable</key><string>NotchiUsage</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleShortVersionString</key><string>0.2.0</string>
-  <key>CFBundleVersion</key><string>0.2.1</string>
+  <key>CFBundleVersion</key><string>0.2.2</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
@@ -26,7 +27,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
-codesign --force --sign - "$APP" >/dev/null 2>&1 || echo "warning: ad-hoc codesign failed" >&2
+codesign --force --sign - --identifier dev.local.notchi-usage "$APP" >/dev/null 2>&1 || echo "warning: ad-hoc codesign failed" >&2
 echo "built $APP"
 if [ "$1" = "--install" ]; then
   rm -rf /Applications/NotchiUsage.app

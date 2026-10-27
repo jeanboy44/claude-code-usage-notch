@@ -527,14 +527,40 @@ fn load_cache() -> Option<Cache> {
     })
 }
 
+/// A generic-password item's secret, read by this app itself through the Security
+/// framework. The Keychain prompt (and "Always Allow") therefore applies to NotchiUsage
+/// only, not to Apple's `security` tool that any other program could also run.
+fn keychain_password(service: &str) -> Option<String> {
+    use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
+    let found = ItemSearchOptions::new()
+        .class(ItemClass::generic_password())
+        .service(service)
+        .load_data(true)
+        .limit(1)
+        .search()
+        .ok()?;
+    match found.into_iter().next()? {
+        SearchResult::Data(bytes) => Some(String::from_utf8_lossy(&bytes).trim().to_string()),
+        _ => None,
+    }
+}
+
+/// Claude Code's own login wins. The desktop app's tokens are only a fallback (they can
+/// belong to another account, and reading them touches a more sensitive keychain item).
 fn read_creds(service: &str) -> Option<Creds> {
-    let out = Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", service, "-w"])
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    let cli = read_cli_creds(service);
+    if cli.as_ref().is_some_and(|c| !c.expired()) {
+        return cli;
+    }
+    read_desktop_creds().or(cli)
+}
+
+/// After a failed desktop read (no app, no item, prompt denied) don't ask again for a while.
+static DESKTOP_RETRY_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+const DESKTOP_RETRY_SECS: i64 = 600;
+
+fn read_cli_creds(service: &str) -> Option<Creds> {
+    let out = keychain_password(service)
         .or_else(|| {
             let home = std::env::var("HOME").ok()?;
             std::fs::read_to_string(format!("{home}/.claude/.credentials.json")).ok()
@@ -545,6 +571,57 @@ fn read_creds(service: &str) -> Option<Creds> {
         token: oauth["accessToken"].as_str()?.to_string(),
         expires_at: oauth["expiresAt"].as_i64().map(|ms| ms / 1000),
     })
+}
+
+/// The Claude desktop app keeps OAuth tokens in `config.json`, encrypted with Electron's
+/// safeStorage (AES-128-CBC; key = PBKDF2-SHA1 of the "Claude Safe Storage" keychain
+/// password). Read-only: the app refreshes its own tokens.
+fn read_desktop_creds() -> Option<Creds> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if now() < DESKTOP_RETRY_AT.load(Relaxed) {
+        return None;
+    }
+    let found = read_desktop_creds_once();
+    if found.is_none() {
+        DESKTOP_RETRY_AT.store(now() + DESKTOP_RETRY_SECS, Relaxed);
+    }
+    found
+}
+
+fn read_desktop_creds_once() -> Option<Creds> {
+    use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+
+    let home = std::env::var("HOME").ok()?;
+    let config: Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{home}/Library/Application Support/Claude/config.json")).ok()?)
+            .ok()?;
+    let password = keychain_password("Claude Safe Storage")?;
+    let mut key = [0u8; 16];
+    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password.as_bytes(), b"saltysalt", 1003, &mut key);
+
+    let mut best: Option<Creds> = None;
+    for field in ["oauth:tokenCacheV2", "oauth:tokenCache"] {
+        let Some(raw) = config[field].as_str().and_then(base64_decode) else { continue };
+        let Some(body) = raw.strip_prefix(b"v10") else { continue };
+        let Ok(dec) = cbc::Decryptor::<aes::Aes128>::new_from_slices(&key, &[b' '; 16]) else { continue };
+        let mut buf = body.to_vec();
+        let Ok(plain) = dec.decrypt_padded_mut::<Pkcs7>(&mut buf) else { continue };
+        let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(plain) else { continue };
+        for (name, entry) in entries {
+            // Usage needs the `user:profile` scope; `user:office` etc. tokens can't read it.
+            // Key shape: `acct:<account>|<client>:<org>:https://api.anthropic.com:<scopes>`.
+            let scopes = name.rsplit_once("https://api.anthropic.com:").map_or("", |(_, s)| s);
+            if !scopes.split_whitespace().any(|s| s == "user:profile") {
+                continue;
+            }
+            let (Some(token), Some(ms)) = (entry["token"].as_str(), entry["expiresAt"].as_i64()) else { continue };
+            let c = Creds { token: token.to_string(), expires_at: Some(ms / 1000) };
+            if best.as_ref().is_none_or(|b| b.expires_at < c.expires_at) {
+                best = Some(c);
+            }
+        }
+    }
+    best
 }
 
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
@@ -576,14 +653,7 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 fn read_antigravity_token() -> Option<(String, Option<i64>)> {
     // 1. Try keychain services "antigravity" and "gemini"
     for service in ["antigravity", "gemini"] {
-        let out = Command::new("/usr/bin/security")
-            .args(["find-generic-password", "-s", service, "-w"])
-            .stderr(Stdio::null())
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-        if let Some(raw) = out {
+        if let Some(raw) = keychain_password(service) {
             let json_str = if let Some(b64) = raw.strip_prefix("go-keyring-base64:") {
                 base64_decode(b64).and_then(|bytes| String::from_utf8(bytes).ok())
             } else {
@@ -774,9 +844,13 @@ fn fetch_antigravity() -> Result<Snapshot, FetchError> {
 }
 
 fn fetch(token: &str) -> Result<Snapshot, FetchError> {
+    // The token goes into a header block on stdin: refuse anything that could add lines.
+    if !token.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~+/=".contains(&b)) {
+        return Err(FetchError::Unauthorized);
+    }
     // Headers go through stdin so the token never appears in `ps`.
     let mut child = Command::new("/usr/bin/curl")
-        .args(["-sS", "-m", "10", "-A", "notchi-usage/0.1", "-H", "@-", "-w", "\n%{http_code} %header{retry-after}", USAGE_URL])
+        .args(["-q", "-sS", "--proto", "=https", "-m", "10", "-A", "notchi-usage/0.1", "-H", "@-", "-w", "\n%{http_code} %header{retry-after}", USAGE_URL])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -877,6 +951,17 @@ mod tests {
         let encoded = "SGVsbG8gQW50aWdyYXZpdHkh";
         let decoded = base64_decode(encoded).unwrap();
         assert_eq!(String::from_utf8(decoded).unwrap(), text);
+    }
+
+    /// Exercises the Claude desktop app path end to end on a machine signed in to it.
+    #[test]
+    #[ignore = "needs a local Claude desktop login and network"]
+    fn desktop_login_fetch() {
+        let creds = read_desktop_creds_once().expect("no usable desktop token");
+        eprintln!("desktop token: expired={} ttl={:?}s", creds.expired(), creds.expires_at.map(|t| t - now()));
+        let snap = fetch(&creds.token).unwrap_or_else(|e| panic!("usage fetch failed: {}", e.message()));
+        eprintln!("session used={:?} weekly used={:?}", snap.five_hour.map(|l| l.used), snap.seven_day.map(|l| l.used));
+        assert!(snap.five_hour.is_some());
     }
 
     #[test]
