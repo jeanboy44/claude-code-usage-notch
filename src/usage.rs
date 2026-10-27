@@ -13,6 +13,10 @@ const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// Manual refreshes closer together than this are coalesced.
 const MIN_GAP: Duration = Duration::from_secs(15);
 const OFFLINE_RETRY: Duration = Duration::from_secs(15);
+/// Retry cadence while credentials are missing or expired (local keychain read only).
+const RELOGIN_RETRY: Duration = Duration::from_secs(15);
+/// The API rejected a token that looked valid; each retry costs a request.
+const UNAUTHORIZED_RETRY: Duration = Duration::from_secs(60);
 /// Never retry a 429 sooner than this, whatever Retry-After says.
 const MIN_RATE_LIMIT_WAIT: u64 = 300;
 
@@ -67,6 +71,8 @@ pub struct Snapshot {
     /// When the numbers above were fetched (0 = never).
     pub fetched_at: i64,
     pub error: Option<&'static str>,
+    /// The source is unreachable (signed out, token dead, offline), as opposed to just throttled.
+    pub dead: bool,
     pub version: u64,
 }
 
@@ -236,6 +242,18 @@ enum FetchError {
 }
 
 impl FetchError {
+    /// No way to reach the numbers right now; a 429 or a 5xx still means the account is alive.
+    fn is_dead(&self) -> bool {
+        matches!(
+            self,
+            FetchError::NoLogin
+                | FetchError::NoLoginAntigravity
+                | FetchError::Expired
+                | FetchError::Unauthorized
+                | FetchError::Offline
+        )
+    }
+
     fn message(&self) -> &'static str {
         match self {
             FetchError::NoLogin => "Not signed in to Claude Code",
@@ -344,6 +362,13 @@ pub fn run(cfg: Config, wake: Receiver<()>) {
         if matches!(claude_outcome, Err(FetchError::Offline)) {
             wait = wait.min(OFFLINE_RETRY.as_secs());
         }
+        // Signed out / expired token: re-reading the keychain is free (no API call is
+        // made), so notice a fresh login within seconds instead of a whole refresh period.
+        if matches!(claude_outcome, Err(FetchError::NoLogin | FetchError::Expired)) {
+            wait = wait.min(RELOGIN_RETRY.as_secs());
+        } else if matches!(claude_outcome, Err(FetchError::Unauthorized)) {
+            wait = wait.min(UNAUTHORIZED_RETRY.as_secs());
+        }
 
         let reset_c = publish(Provider::Claude, claude_outcome);
         let reset_a = publish(Provider::Antigravity, antigravity_outcome);
@@ -399,7 +424,7 @@ fn publish(provider: Provider, outcome: Result<Snapshot, FetchError>) -> Option<
             Snapshot { version, ..s }
         }
         // Keep the last good numbers; the UI shows their age next to the error.
-        Err(e) => Snapshot { error: Some(e.message()), version, ..prev.unwrap_or_default() },
+        Err(e) => Snapshot { error: Some(e.message()), dead: e.is_dead(), version, ..prev.unwrap_or_default() },
     };
     let t = now();
     let next_reset = snap.limits().filter_map(|l| l.resets_at).filter(|&at| at > t).min();
@@ -478,6 +503,7 @@ fn load_cache() -> Option<Cache> {
         seven_day_sonnet: limit(&v, "seven_day_sonnet"),
         fetched_at,
         error: None,
+        dead: false,
         version: 0,
     });
 
@@ -489,6 +515,7 @@ fn load_cache() -> Option<Cache> {
         seven_day_sonnet: limit(ag, "seven_day_sonnet"),
         fetched_at,
         error: None,
+        dead: false,
         version: 0,
     });
 
@@ -660,6 +687,7 @@ fn fetch_antigravity_cli_quota() -> Result<Snapshot, FetchError> {
         seven_day_sonnet: None,
         fetched_at: now(),
         error: None,
+        dead: false,
         version: 0,
     })
 }
@@ -740,6 +768,7 @@ fn fetch_antigravity() -> Result<Snapshot, FetchError> {
         }),
         fetched_at: t_now,
         error: None,
+        dead: false,
         version: 0,
     })
 }
@@ -788,6 +817,7 @@ fn fetch(token: &str) -> Result<Snapshot, FetchError> {
         seven_day_sonnet: limit("seven_day_sonnet"),
         fetched_at: now(),
         error: None,
+        dead: false,
         version: 0,
     })
 }

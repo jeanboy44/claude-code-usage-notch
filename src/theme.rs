@@ -40,6 +40,8 @@ pub const TEXT_TERTIARY: Color = CLOUD.alpha(0.75); // ≥ 4.5:1 on black
 pub const TRACK: Color = IVORY.alpha(0.12);
 pub const CLAWD: Color = CLAUDE_ORANGE;
 pub const CLAWD_EYE: Color = BLACK;
+/// Clawd with the power out: the clay body, desaturated.
+pub const DEAD: Color = Color::hex(0x6B6963);
 #[allow(dead_code)]
 pub const ANTIGRAVITY: Color = Color::hex(0x4E88F5);
 pub const ANTIGRAVITY_EYE: Color = BLACK;
@@ -107,6 +109,8 @@ pub const SESSION_GAP: f64 = 8.0; // weekly bar ↔ session %
 pub const fn week_bar_w() -> f64 {
     7.0 * WEEK_SEG_W + 6.0 * WEEK_SEG_GAP
 }
+/// How far the collapsed blob extends past the cutout's right edge.
+pub const NOTCH_OVERHANG: f64 = 1.0;
 pub const FLARE: f64 = 6.0; // concave top corners melting into the bezel
 pub const EXPANDED_W: f64 = 400.0;
 pub const PAD: f64 = 22.0;

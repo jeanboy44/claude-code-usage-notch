@@ -440,7 +440,9 @@ impl NotchView {
         let g = Geometry::current(self.mtm())?;
         self.ivars().notch_h.set(g.notch_h);
         let lw = self.total_left_width(g.notch_h);
-        let rw = -(g.notch_w / 2.0);
+        // The body runs across the whole cutout and ends `NOTCH_OVERHANG` past its right edge,
+        // so its own rounded corner replaces the hardware's instead of meeting it mid-curve.
+        let rw = if g.notch_w > 0.0 { theme::NOTCH_OVERHANG } else { 0.0 };
 
         let active = self.active_providers();
         let (cw, ew) = (
@@ -449,7 +451,10 @@ impl NotchView {
         );
         let eh = multi_expanded_height(g.notch_h, &active);
         let notch_left = g.center_x - g.notch_w / 2.0;
-        let collapsed = NSRect::new(pt(notch_left - FLARE - lw, g.top - g.notch_h), NSSize::new(cw, g.notch_h));
+        // No camera cutout (external display, older Mac): hang a centred pill from the
+        // menu bar instead of an ear that would end mid-screen.
+        let x = if g.notch_w > 0.0 { notch_left - FLARE - lw } else { g.center_x - cw / 2.0 };
+        let collapsed = NSRect::new(pt(x, g.top - g.notch_h), NSSize::new(cw, g.notch_h));
         let expanded = NSRect::new(pt(g.center_x - ew / 2.0, g.top - eh), NSSize::new(ew, eh));
         Some((collapsed, expanded))
     }
@@ -575,6 +580,9 @@ impl NotchView {
         let mut moving = false;
         for &p in &self.active_providers() {
             let snap = snapshot_for(p);
+            if snap.as_ref().is_some_and(|s| s.dead) {
+                continue;
+            }
             let ears = ProviderEar::new(p, snap.as_ref(), notch_h, false);
             let (_, stance) = perch(ears.week_left);
             let cs = self.char_state(p);
@@ -633,8 +641,11 @@ impl NotchView {
         }
         self.settle();
         let now = media_now();
-        iv.claude_char.tremble_until.set(now + theme::TREMBLE_BURST);
-        iv.antigravity_char.tremble_until.set(now + theme::TREMBLE_BURST);
+        for (p, cs) in [(Provider::Claude, &iv.claude_char), (Provider::Antigravity, &iv.antigravity_char)] {
+            if !snapshot_for(p).is_some_and(|s| s.dead) {
+                cs.tremble_until.set(now + theme::TREMBLE_BURST);
+            }
+        }
         self.update_teeter();
         iv.blink.set(true);
         self.setNeedsDisplay(true);
@@ -704,9 +715,11 @@ impl NotchView {
                 let bar_y = (notch_h - char_h - theme::WEEK_BAR_H) / 2.0 + char_h;
                 week_bar(bar_x, bar_y, ear.week_left, ear.week_color);
 
-                let (segments, stance) = perch(ear.week_left);
-                let stand_cy = bar_y - char_h / 2.0;
                 let mood = Mood::of(snap.as_ref());
+                let dead = mood == Mood::Dead;
+                let (segments, stance) = perch(ear.week_left);
+                let stance = if dead { Stance::Calm } else { stance };
+                let stand_cy = bar_y - char_h / 2.0;
 
                 NSGraphicsContext::saveGraphicsState_class();
                 collapsed_outline(w, notch_h, self.radius(false)).addClip();
@@ -759,7 +772,13 @@ impl NotchView {
                     draw_character(p, cx, stand_cy, sprite, scale, mood, pose);
                 } else {
                     cs.gone.set(false);
-                    let (offset, walking, dir) = self.walk_to(p, segments_centre(segments));
+                    let (offset, walking, dir) = if dead {
+                        let at = segments_centre(segments);
+                        cs.walk.set(Walk { from: at, to: at, start: now, duration: 0.0 });
+                        (at, false, 0.0)
+                    } else {
+                        self.walk_to(p, segments_centre(segments))
+                    };
                     let cx = bar_x + offset;
                     let shiver = stance == Stance::Tremble && !walking && motion && now < cs.tremble_until.get();
                     if shiver {
@@ -769,7 +788,7 @@ impl NotchView {
                     let face = if stance == Stance::Tremble { Mood::Careful } else { mood };
                     let step = walking.then(|| (now / 0.14) as i64 % 2 == 0);
                     let bob = if step == Some(true) { -0.4 } else { 0.0 };
-                    let pose = Pose { blink: iv.blink.get() && !walking, step, look: dir * 0.6, ..Pose::default() };
+                    let pose = Pose { blink: iv.blink.get() && !walking && !dead, step, look: dir * 0.6, ..Pose::default() };
                     draw_character(p, cx, stand_cy + bob, sprite, scale, face, pose);
                 }
                 NSGraphicsContext::restoreGraphicsState_class();
@@ -1365,10 +1384,15 @@ pub enum Mood {
     Busy,
     Careful,
     Dizzy,
+    /// Signed out or offline: grey and still.
+    Dead,
 }
 
 impl Mood {
     fn of(s: Option<&Snapshot>) -> Self {
+        if s.is_some_and(|s| s.dead) {
+            return Mood::Dead;
+        }
         let tightest = s.and_then(|s| rows(s).into_iter().map(|(_, l)| l.left()).reduce(f64::min));
         match tightest {
             None => Mood::Sleepy,
@@ -1386,6 +1410,7 @@ impl Mood {
             Mood::Busy => "Cruising along",
             Mood::Careful => "Pace yourself",
             Mood::Dizzy => "Almost out",
+            Mood::Dead => "Disconnected",
         }
     }
 }
@@ -1425,7 +1450,7 @@ pub fn critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, pose: Pose) {
         0.0
     };
 
-    theme::CLAWD.ns().set();
+    (if mood == Mood::Dead { theme::DEAD } else { theme::CLAWD }).ns().set();
     rect(3.0, 5.0, 18.0, 12.08); // body
     rect(0.0, 10.95 - flap, 3.0, 3.1); // left arm
     rect(21.0, 10.95 + flap, 3.0, 3.1); // right arm
@@ -1442,7 +1467,7 @@ pub fn critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, pose: Pose) {
         rect(10.6, 14.2, 2.8, 1.9);
     } else {
         let (eye_top, eye_h) = match mood {
-            Mood::Sleepy => (10.1, 0.85),
+            Mood::Sleepy | Mood::Dead => (10.1, 0.85),
             Mood::Dizzy => (9.1, 0.9),
             _ if blink => (10.1, 0.85),
             _ => (8.1, 2.85),
@@ -1522,6 +1547,14 @@ const ANTIGRAVITY_PIXELS: &[(f64, f64, u32)] = &[
 
 /// Antigravity character: 12x10 pixel art rainbow gradient arch with matching
 /// personality states (Calm, Tremble, Teeter, Gone, Panic, Sweat).
+/// Luminance-preserving grey of an `0xRRGGBB` colour, so the sprite keeps its shading when dead.
+fn grey_of(rgb: u32) -> u32 {
+    let c = |shift: u32| ((rgb >> shift) & 0xff) as f64;
+    let y = (0.3 * c(16) + 0.59 * c(8) + 0.11 * c(0)).round() as u32;
+    let y = (y * 3 / 5).min(255);
+    (y << 16) | (y << 8) | y
+}
+
 pub fn antigravity_critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, pose: Pose) {
     let Pose { blink, panic, step, look } = pose;
     let u = s / 24.0;
@@ -1546,7 +1579,7 @@ pub fn antigravity_critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, pos
         } else if right_lifted && px >= 8.0 && py >= 8.0 {
             py_lift = -0.6 * px_size;
         }
-        Color::hex(hex).ns().set();
+        if mood == Mood::Dead { Color::hex(grey_of(hex)) } else { Color::hex(hex) }.ns().set();
         rect(x0 + px * px_size, y0 + py * px_size + py_lift, px_size, px_size);
     }
 
@@ -1569,7 +1602,7 @@ pub fn antigravity_critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, pos
         rect(x0 + 6.0 * px_size - mouth_w / 2.0, y0 + 4.3 * px_size, mouth_w, mouth_h);
     } else {
         let (eye_top, eye_h) = match mood {
-            Mood::Sleepy => (y0 + 4.9 * px_size, 0.5 * px_size),
+            Mood::Sleepy | Mood::Dead => (y0 + 4.9 * px_size, 0.5 * px_size),
             Mood::Dizzy => (y0 + 4.6 * px_size, 0.6 * px_size),
             _ if blink => (y0 + 4.9 * px_size, 0.5 * px_size),
             _ => (y0 + 4.2 * px_size, 1.6 * px_size),
@@ -1735,6 +1768,10 @@ fn main() {
     }
     if let Some(dir) = args.iter().position(|a| a == "--render-readme").and_then(|i| args.get(i + 1)) {
         render::readme_frames(mtm, dir);
+        return;
+    }
+    if let Some(dir) = args.iter().position(|a| a == "--render-flat").and_then(|i| args.get(i + 1)) {
+        render::flat_preview(mtm, dir);
         return;
     }
     let show_claude = cfg.show_claude;

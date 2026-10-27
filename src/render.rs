@@ -86,7 +86,7 @@ pub fn readme_frames(mtm: MainThreadMarker, dir: &str) {
 }
 
 /// Wallpaper + translucent menu bar + the hardware notch, on a `size` canvas.
-fn backdrop(size: NSSize) {
+fn backdrop(size: NSSize, cutout: bool) {
     Color::hex(0xD9E3EF).ns().set();
     NSBezierPath::fillRect(NSRect::new(pt(0.0, 0.0), size));
     Color::hex(0xFFFFFF).alpha(0.55).ns().set();
@@ -96,8 +96,10 @@ fn backdrop(size: NSSize) {
     text_up("\u{F8FF}", 16.0, y, &menu, Color::hex(0x1D1D1F));
     text_up("9:41", size.width - 52.0, y, &menu, Color::hex(0x1D1D1F));
     // The camera cutout itself.
-    theme::SURFACE.ns().set();
-    notch_bezier(notch_rect(size), theme::RADIUS_COLLAPSED).fill();
+    if cutout {
+        theme::SURFACE.ns().set();
+        notch_bezier(notch_rect(size), theme::RADIUS_COLLAPSED).fill();
+    }
 }
 
 fn notch_rect(size: NSSize) -> NSRect {
@@ -110,13 +112,13 @@ fn collapsed_frame(view: &NotchView, week_left: f64) -> Retained<NSImage> {
     let notch = notch_rect(size);
     let blob = NSRect::new(
         pt(notch.origin.x - FLARE - lw, notch.origin.y),
-        NSSize::new(lw + NOTCH_W / 2.0 + 2.0 * FLARE, NOTCH_H),
+        NSSize::new(lw + NOTCH_W + theme::NOTCH_OVERHANG + 2.0 * FLARE, NOTCH_H),
     );
     let iv = view.ivars();
     iv.expanded.set(false);
     iv.shown_expanded.set(false);
     paint(size, |size| {
-        backdrop(size);
+        backdrop(size, true);
         theme::SURFACE.ns().set();
         notch_bezier(blob, theme::RADIUS_COLLAPSED.min(NOTCH_H * theme::RADIUS_COLLAPSED_MAX_RATIO)).fill();
         draw_view(view, blob);
@@ -137,7 +139,7 @@ fn expanded_frame(view: &NotchView, _snap: &Snapshot) -> Retained<NSImage> {
     iv.expanded.set(true);
     iv.shown_expanded.set(true);
     paint(size, |size| {
-        backdrop(size);
+        backdrop(size, true);
         theme::SURFACE.ns().set();
         notch_bezier(panel, theme::RADIUS_EXPANDED).fill();
         draw_view(view, panel);
@@ -231,4 +233,56 @@ fn collapsed_outline_at(origin: NSPoint, w: f64, h: f64, r: f64) -> Retained<NSB
     t.translateXBy_yBy(origin.x, origin.y);
     p.transformUsingAffineTransform(&t);
     p
+}
+
+/// `--render-flat <dir>`: how the panel looks on a display without a camera cutout.
+pub fn flat_preview(mtm: MainThreadMarker, dir: &str) {
+    let _ = std::fs::create_dir_all(dir);
+    let now = usage::now();
+    let limit = |used: f64, reset_in: i64| Some(Limit { used, resets_at: Some(now + reset_in) });
+    let snap = Snapshot {
+        five_hour: limit(28.0, 2 * 3600 + 13 * 60),
+        seven_day: limit(41.0, 3 * 86400 + 5 * 3600),
+        fetched_at: now,
+        ..Snapshot::default()
+    };
+    let view = NotchView::new(mtm, CAShapeLayer::new());
+    view.ivars().notch_h.set(NOTCH_H);
+    view.ivars().show_claude.set(true);
+    view.ivars().show_antigravity.set(true);
+    usage::set_snapshot(snap.clone());
+    usage::set_snapshot_for(usage::Provider::Antigravity, snap);
+    CLOCK.with(|c| c.set(Some(CACurrentMediaTime())));
+
+    let lw = view.total_left_width(NOTCH_H);
+    let cw = lw + 2.0 * FLARE;
+    let size = NSSize::new(CANVAS_W, NOTCH_H + 14.0);
+    let blob = NSRect::new(pt((size.width - cw) / 2.0, size.height - NOTCH_H), NSSize::new(cw, NOTCH_H));
+    let iv = view.ivars();
+    iv.expanded.set(false);
+    iv.shown_expanded.set(false);
+    let image = paint(size, |size| {
+        backdrop(size, false);
+        theme::SURFACE.ns().set();
+        notch_bezier(blob, theme::RADIUS_COLLAPSED.min(NOTCH_H * theme::RADIUS_COLLAPSED_MAX_RATIO)).fill();
+        draw_view(&view, blob);
+    });
+    save_png(&image, &format!("{dir}/flat-collapsed.png"));
+
+    CLOCK.with(|c| c.set(None));
+    let active = view.active_providers();
+    let ew = (2.0 * FLARE + 2.0 * lw).max(EXPANDED_W);
+    let eh = multi_expanded_height(NOTCH_H, &active);
+    let size = NSSize::new(CANVAS_W.max(ew + 60.0), eh + 30.0);
+    let panel = NSRect::new(pt((size.width - ew) / 2.0, size.height - eh), NSSize::new(ew, eh));
+    iv.expanded.set(true);
+    iv.shown_expanded.set(true);
+    let image = paint(size, |size| {
+        backdrop(size, false);
+        theme::SURFACE.ns().set();
+        notch_bezier(panel, theme::RADIUS_EXPANDED).fill();
+        draw_view(&view, panel);
+    });
+    save_png(&image, &format!("{dir}/flat-expanded.png"));
+    println!("rendered flat previews into {dir}");
 }
