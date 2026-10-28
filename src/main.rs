@@ -302,6 +302,8 @@ impl NotchView {
             Provider::Antigravity => iv.show_antigravity.set(visible),
         }
         save_provider_config(iv.show_claude.get(), iv.show_antigravity.get());
+        // The worker reads the saved toggle; wake it so a newly enabled row fills in now.
+        wake_worker();
         self.update_accessibility();
 
         // Immediately update window frame and morph smoothly

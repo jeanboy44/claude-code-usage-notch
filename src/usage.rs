@@ -17,6 +17,11 @@ const OFFLINE_RETRY: Duration = Duration::from_secs(15);
 const RELOGIN_RETRY: Duration = Duration::from_secs(15);
 /// The API rejected a token that looked valid; each retry costs a request.
 const UNAUTHORIZED_RETRY: Duration = Duration::from_secs(60);
+/// After `agy` fails (token refresh error, hung login) leave it alone this long: with a dead
+/// login each run opens a browser sign-in page.
+const AGY_RETRY_SECS: i64 = 1800;
+/// A run still going after this is waiting on an interactive login; kill it.
+const AGY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Never retry a 429 sooner than this, whatever Retry-After says.
 const MIN_RATE_LIMIT_WAIT: u64 = 300;
 
@@ -328,7 +333,15 @@ pub fn run(cfg: Config, wake: Receiver<()>) {
         };
 
         // --- Antigravity ---
-        let antigravity_outcome = fetch_antigravity();
+        // Only when its row is enabled: `agy` opens a browser login when its token is dead.
+        // The toggle is saved to the config file, so re-read it each round.
+        let antigravity_outcome = if Config::load().show_antigravity {
+            Some(fetch_antigravity())
+        } else {
+            // Re-enabling the row starts clean instead of waiting out an old backoff.
+            AGY_RETRY_AT.store(0, std::sync::atomic::Ordering::Relaxed);
+            None
+        };
 
         // Stderr logging
         match &claude_outcome {
@@ -341,13 +354,14 @@ pub fn run(cfg: Config, wake: Receiver<()>) {
             Err(e) => eprintln!("[{}] claude error: {}", now(), e.message()),
         }
         match &antigravity_outcome {
-            Ok(snap) => eprintln!(
+            Some(Ok(snap)) => eprintln!(
                 "[{}] antigravity ok session={:?} weekly={:?}",
                 now(),
                 snap.five_hour.map(|l| l.used),
                 snap.seven_day.map(|l| l.used)
             ),
-            Err(e) => eprintln!("[{}] antigravity error: {}", now(), e.message()),
+            Some(Err(e)) => eprintln!("[{}] antigravity error: {}", now(), e.message()),
+            None => {}
         }
 
         let retry_after = match &claude_outcome {
@@ -371,7 +385,7 @@ pub fn run(cfg: Config, wake: Receiver<()>) {
         }
 
         let reset_c = publish(Provider::Claude, claude_outcome);
-        let reset_a = publish(Provider::Antigravity, antigravity_outcome);
+        let reset_a = antigravity_outcome.and_then(|o| publish(Provider::Antigravity, o));
         let next_reset = match (reset_c, reset_a) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
@@ -695,12 +709,24 @@ fn fetch_antigravity_cli_quota() -> Result<Snapshot, FetchError> {
         format!("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{existing_path}")
     };
 
-    let output = Command::new(agy_bin)
+    let mut child = Command::new(agy_bin)
         .args(["-p", "/usage", "--output-format", "json"])
         .env("PATH", path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .spawn()
         .map_err(|_| FetchError::Other("agy command failed to start"))?;
+    let started = Instant::now();
+    while child.try_wait().ok().flatten().is_none() {
+        if started.elapsed() > AGY_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(FetchError::Other("agy timed out"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let output = child.wait_with_output().map_err(|_| FetchError::Other("agy command failed to start"))?;
 
     if !output.status.success() {
         return Err(FetchError::Other("agy command exited with error"));
@@ -762,9 +788,16 @@ fn fetch_antigravity_cli_quota() -> Result<Snapshot, FetchError> {
     })
 }
 
+/// Unix time before which `agy` must not be run again (0 = free to run).
+static AGY_RETRY_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
 fn fetch_antigravity() -> Result<Snapshot, FetchError> {
-    if let Ok(snap) = fetch_antigravity_cli_quota() {
-        return Ok(snap);
+    use std::sync::atomic::Ordering::Relaxed;
+    if now() >= AGY_RETRY_AT.load(Relaxed) {
+        match fetch_antigravity_cli_quota() {
+            Ok(snap) => return Ok(snap),
+            Err(_) => AGY_RETRY_AT.store(now() + AGY_RETRY_SECS, Relaxed),
+        }
     }
 
     let Some((_token, _exp)) = read_antigravity_token() else {
