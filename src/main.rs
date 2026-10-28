@@ -1472,10 +1472,10 @@ pub fn critter(cx: f64, cy: f64, s: f64, scale: f64, mood: Mood, pose: Pose) {
             Mood::Sleepy | Mood::Dead => (10.1, 0.85),
             Mood::Dizzy => (9.1, 0.9),
             _ if blink => (10.1, 0.85),
-            _ => (8.1, 2.85),
+            _ => (7.8, 3.4),
         };
-        for ex in [6.0, 16.51] {
-            rect(ex + look, eye_top, 1.49, eye_h);
+        for ex in [5.8, 16.3] {
+            rect(ex + look, eye_top, 1.9, eye_h);
         }
     }
 
