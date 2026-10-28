@@ -541,22 +541,17 @@ fn load_cache() -> Option<Cache> {
     })
 }
 
-/// A generic-password item's secret, read by this app itself through the Security
-/// framework. The Keychain prompt (and "Always Allow") therefore applies to NotchiUsage
-/// only, not to Apple's `security` tool that any other program could also run.
+/// A generic-password item's secret, read through Apple's `security` tool. "Always Allow" is
+/// then tied to that stable system binary instead of this app's (ad-hoc, per-build) code
+/// signature, so it survives app updates and rebuilds instead of re-prompting each time.
 fn keychain_password(service: &str) -> Option<String> {
-    use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
-    let found = ItemSearchOptions::new()
-        .class(ItemClass::generic_password())
-        .service(service)
-        .load_data(true)
-        .limit(1)
-        .search()
-        .ok()?;
-    match found.into_iter().next()? {
-        SearchResult::Data(bytes) => Some(String::from_utf8_lossy(&bytes).trim().to_string()),
-        _ => None,
-    }
+    Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", service, "-w"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
 /// Claude Code's own login wins. The desktop app's tokens are only a fallback (they can

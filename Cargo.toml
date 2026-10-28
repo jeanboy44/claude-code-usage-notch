@@ -1,6 +1,6 @@
 [package]
 name = "notchi-usage"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 description = "A tiny, cute Claude usage meter living in the MacBook notch"
 
@@ -30,7 +30,6 @@ aes = "0.8"
 cbc = "0.1"
 pbkdf2 = "0.12"
 sha1 = "0.10"
-security-framework = "3"
 
 [profile.release]
 opt-level = "s"
