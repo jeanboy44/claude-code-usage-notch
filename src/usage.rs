@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 /// Manual refreshes closer together than this are coalesced.
 const MIN_GAP: Duration = Duration::from_secs(15);
 const OFFLINE_RETRY: Duration = Duration::from_secs(15);
@@ -179,6 +180,8 @@ pub struct Config {
     pub keychain_service: String,
     pub show_claude: bool,
     pub show_antigravity: bool,
+    /// Which Claude account to show: an account email or UUID, or empty for automatic.
+    pub claude_account: String,
 }
 
 impl Config {
@@ -189,6 +192,7 @@ impl Config {
             keychain_service: "Claude Code-credentials".into(),
             show_claude: true,
             show_antigravity: true,
+            claude_account: String::new(),
         };
         let Ok(home) = std::env::var("HOME") else { return c };
         let Ok(text) = std::fs::read_to_string(format!("{home}/.config/notchi-usage/config")) else { return c };
@@ -200,6 +204,7 @@ impl Config {
                 "keychain_service" => c.keychain_service = v.to_string(),
                 "show_claude" => c.show_claude = v.parse().unwrap_or(c.show_claude),
                 "show_antigravity" => c.show_antigravity = v.parse().unwrap_or(c.show_antigravity),
+                "claude_account" => c.claude_account = if v == "auto" { String::new() } else { v.to_string() },
                 _ => {}
             }
         }
@@ -212,6 +217,16 @@ impl Config {
 }
 
 pub fn save_provider_config(show_claude: bool, show_antigravity: bool) {
+    save_config(&[("show_claude", show_claude.to_string()), ("show_antigravity", show_antigravity.to_string())]);
+}
+
+/// Pins the Claude account to show (`None` = automatic).
+pub fn save_claude_account(id: Option<&str>) {
+    save_config(&[("claude_account", id.unwrap_or("auto").to_string())]);
+}
+
+/// Rewrites the given keys in the config file, keeping every other line.
+fn save_config(entries: &[(&str, String)]) {
     let Ok(home) = std::env::var("HOME") else { return };
     let dir = format!("{home}/.config/notchi-usage");
     let path = format!("{dir}/config");
@@ -219,14 +234,10 @@ pub fn save_provider_config(show_claude: bool, show_antigravity: bool) {
     let mut lines: Vec<String> = std::fs::read_to_string(&path)
         .unwrap_or_default()
         .lines()
-        .filter(|l| {
-            let t = l.trim();
-            !t.starts_with("show_claude") && !t.starts_with("show_antigravity")
-        })
+        .filter(|l| !l.split_once('=').is_some_and(|(k, _)| entries.iter().any(|(e, _)| k.trim() == *e)))
         .map(String::from)
         .collect();
-    lines.push(format!("show_claude = {show_claude}"));
-    lines.push(format!("show_antigravity = {show_antigravity}"));
+    lines.extend(entries.iter().map(|(k, v)| format!("{k} = {v}")));
     let _ = std::fs::write(&path, lines.join("\n") + "\n");
 }
 
@@ -271,6 +282,7 @@ impl FetchError {
     }
 }
 
+#[derive(Clone)]
 struct Creds {
     token: String,
     /// Unix seconds.
@@ -284,12 +296,14 @@ impl Creds {
 }
 
 pub fn run(cfg: Config, wake: Receiver<()>) {
-    let mut creds: Option<Creds> = None;
     let mut backoff = 1u64;
+    // Account the Claude numbers (and history graph) belong to.
+    let mut shown_account: Option<String> = None;
 
     // Restore the last numbers so a restart shows data instantly and doesn't re-poll
     // (or re-trip a 429) before the previous schedule says so.
     if let Some(cache) = load_cache() {
+        shown_account = cache.account;
         let mut next_reset = None;
         if let Some(snap_c) = cache.snapshot {
             next_reset = publish(Provider::Claude, Ok(snap_c));
@@ -313,29 +327,45 @@ pub fn run(cfg: Config, wake: Receiver<()>) {
     }
 
     loop {
+        // The menu writes the account choice and toggles to the config file.
+        let live = Config::load();
+
         // --- Claude Code ---
-        if creds.as_ref().is_none_or(Creds::expired) {
-            creds = read_creds(&cfg.keychain_service);
-        }
-        let claude_outcome = match &creds {
+        let mut logins = claude_logins(&cfg.keychain_service);
+        let mut picked = pick_login(&logins, &live.claude_account);
+        let mut claude_outcome = match picked.and_then(|i| logins.get(i)) {
             None => Err(FetchError::NoLogin),
-            Some(c) if c.expired() => Err(FetchError::Expired),
-            Some(c) => match fetch(&c.token) {
-                Err(FetchError::Unauthorized) => {
-                    creds = read_creds(&cfg.keychain_service);
-                    match &creds {
-                        Some(c) if !c.expired() => fetch(&c.token),
-                        _ => Err(FetchError::Expired),
-                    }
-                }
-                r => r,
-            },
+            Some(l) if l.creds.expired() => Err(FetchError::Expired),
+            Some(l) => fetch(&l.creds.token),
         };
+        if matches!(claude_outcome, Err(FetchError::Unauthorized)) {
+            // The app may have refreshed its token since we last decrypted it.
+            DESKTOP_CACHE.lock().unwrap_or_else(|e| e.into_inner()).take();
+            logins = claude_logins(&cfg.keychain_service);
+            picked = pick_login(&logins, &live.claude_account);
+            claude_outcome = match picked.and_then(|i| logins.get(i)) {
+                Some(l) if !l.creds.expired() => fetch(&l.creds.token),
+                _ => Err(FetchError::Expired),
+            };
+        }
+        let account = picked.and_then(|i| logins.get(i)).map(|l| l.account.id.clone());
+        if account.is_some() && account != shown_account {
+            // Another account's numbers: its history graph doesn't carry over.
+            if shown_account.is_some() {
+                CLAUDE_HISTORY.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                if claude_outcome.is_err() {
+                    *CLAUDE_STATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
+            }
+            shown_account = account.clone();
+        }
+        set_claude_accounts(logins.into_iter().map(|l| l.account).collect(), account);
 
         // --- Antigravity ---
         // Only when its row is enabled: `agy` opens a browser login when its token is dead.
         // The toggle is saved to the config file, so re-read it each round.
-        let antigravity_outcome = if Config::load().show_antigravity {
+        let antigravity_outcome = if live.show_antigravity {
+            *ANTIGRAVITY_ACCOUNT.lock().unwrap_or_else(|e| e.into_inner()) = antigravity_email();
             Some(fetch_antigravity())
         } else {
             // Re-enabling the row starts clean instead of waiting out an old backoff.
@@ -397,7 +427,7 @@ pub fn run(cfg: Config, wake: Receiver<()>) {
             // Re-check just after the next window resets so numbers never go stale.
             wait = wait.min((at - now() + 10).max(5) as u64);
         }
-        save_cache(now() + wait as i64, retry_after.is_some());
+        save_cache(now() + wait as i64, retry_after.is_some(), shown_account.as_deref());
 
         // Clicks never hammer the endpoint or skip a 429 backoff.
         if !sleep(&wake, Duration::from_secs(wait), retry_after.is_none()) {
@@ -453,13 +483,15 @@ struct Cache {
     snapshot_antigravity: Option<Snapshot>,
     next_fetch_at: i64,
     rate_limited: bool,
+    /// Claude account the snapshot belongs to.
+    account: Option<String>,
 }
 
 fn cache_path() -> Option<String> {
     Some(format!("{}/Library/Caches/notchi-usage/state.json", std::env::var("HOME").ok()?))
 }
 
-fn save_cache(next_fetch_at: i64, rate_limited: bool) {
+fn save_cache(next_fetch_at: i64, rate_limited: bool, account: Option<&str>) {
     let Some(path) = cache_path() else { return };
     let snap_c = snapshot_for(Provider::Claude).unwrap_or_default();
     let snap_a = snapshot_for(Provider::Antigravity).unwrap_or_default();
@@ -468,6 +500,7 @@ fn save_cache(next_fetch_at: i64, rate_limited: bool) {
         "fetched_at": snap_c.fetched_at,
         "next_fetch_at": next_fetch_at,
         "rate_limited": rate_limited,
+        "account": account,
         "five_hour": limit(snap_c.five_hour),
         "seven_day": limit(snap_c.seven_day),
         "seven_day_opus": limit(snap_c.seven_day_opus),
@@ -538,6 +571,7 @@ fn load_cache() -> Option<Cache> {
         snapshot_antigravity: snap_a,
         next_fetch_at: v["next_fetch_at"].as_i64().unwrap_or(0),
         rate_limited: v["rate_limited"].as_bool().unwrap_or(false),
+        account: v["account"].as_str().map(String::from),
     })
 }
 
@@ -554,50 +588,202 @@ fn keychain_password(service: &str) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
-/// Claude Code's own login wins. The desktop app's tokens are only a fallback (they can
-/// belong to another account, and reading them touches a more sensitive keychain item).
-fn read_creds(service: &str) -> Option<Creds> {
-    let cli = read_cli_creds(service);
-    if cli.as_ref().is_some_and(|c| !c.expired()) {
-        return cli;
-    }
-    read_desktop_creds().or(cli)
+/// One Claude account Notchi can read usage for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Account {
+    /// Account UUID, when known.
+    pub id: String,
+    pub email: Option<String>,
+    /// Claude Code (the CLI) is signed in to it.
+    pub cli: bool,
+    /// The Claude desktop app is signed in to it.
+    pub desktop: bool,
+    /// The account the desktop app last used.
+    pub desktop_active: bool,
 }
 
+impl Account {
+    pub fn label(&self) -> String {
+        self.email.clone().unwrap_or_else(|| format!("Account {}", self.id.get(..8).unwrap_or(&self.id)))
+    }
+
+    /// Where it is signed in, e.g. "Claude Code · Claude app".
+    pub fn sources(&self) -> String {
+        let mut s = Vec::new();
+        if self.cli {
+            s.push("Claude Code");
+        }
+        if self.desktop {
+            s.push(if self.desktop_active { "Claude app (current)" } else { "Claude app" });
+        }
+        s.join(" · ")
+    }
+
+    fn matches(&self, wanted: &str) -> bool {
+        self.id.eq_ignore_ascii_case(wanted) || self.email.as_deref().is_some_and(|e| e.eq_ignore_ascii_case(wanted))
+    }
+}
+
+/// Every Claude account found on this Mac, and the one being shown.
+static CLAUDE_ACCOUNTS: Mutex<(Vec<Account>, Option<String>)> = Mutex::new((Vec::new(), None));
+static ANTIGRAVITY_ACCOUNT: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn claude_accounts() -> Vec<Account> {
+    CLAUDE_ACCOUNTS.lock().unwrap_or_else(|e| e.into_inner()).0.clone()
+}
+
+/// The account whose numbers a provider shows, as a label.
+pub fn current_account(provider: Provider) -> Option<String> {
+    match provider {
+        Provider::Claude => {
+            let g = CLAUDE_ACCOUNTS.lock().unwrap_or_else(|e| e.into_inner());
+            let id = g.1.as_deref()?;
+            g.0.iter().find(|a| a.id == id).map(Account::label)
+        }
+        Provider::Antigravity => ANTIGRAVITY_ACCOUNT.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+    }
+}
+
+/// The pinned Claude account from the config file (`None` = automatic).
+pub fn chosen_claude_account() -> Option<String> {
+    Some(Config::load().claude_account).filter(|s| !s.is_empty())
+}
+
+fn set_claude_accounts(accounts: Vec<Account>, shown: Option<String>) {
+    *CLAUDE_ACCOUNTS.lock().unwrap_or_else(|e| e.into_inner()) = (accounts, shown);
+}
+
+struct Login {
+    account: Account,
+    creds: Creds,
+}
+
+/// All usable Claude logins: Claude Code's own first, then each other desktop-app account.
+fn claude_logins(service: &str) -> Vec<Login> {
+    let mut logins = Vec::new();
+    if let Some(creds) = read_cli_creds(service) {
+        let (id, email) = cli_account().unwrap_or_else(|| ("claude-code".into(), None));
+        logins.push(Login { account: Account { id, email, cli: true, desktop: false, desktop_active: false }, creds });
+    }
+    let Some(desktop) = desktop_logins() else { return logins };
+    for (id, creds) in desktop.tokens {
+        let active = desktop.active.as_deref() == Some(id.as_str());
+        if let Some(l) = logins.iter_mut().find(|l| l.account.id == id) {
+            l.account.desktop = true;
+            l.account.desktop_active = active;
+            // Same account in both: use whichever token lives longer.
+            if l.creds.expires_at < creds.expires_at {
+                l.creds = creds;
+            }
+            continue;
+        }
+        let email = account_email(&id, &creds);
+        logins.push(Login { account: Account { id, email, cli: false, desktop: true, desktop_active: active }, creds });
+    }
+    logins
+}
+
+/// The login to show: the pinned account if it is still signed in, else Claude Code's own
+/// login while it is valid, else the desktop app's current account, else any valid one.
+fn pick_login(logins: &[Login], wanted: &str) -> Option<usize> {
+    if !wanted.is_empty() {
+        if let Some(i) = logins.iter().position(|l| l.account.matches(wanted)) {
+            return Some(i);
+        }
+    }
+    let valid = |l: &&Login| !l.creds.expired();
+    logins
+        .iter()
+        .position(|l| l.account.cli && valid(&l))
+        .or_else(|| logins.iter().position(|l| l.account.desktop_active && valid(&l)))
+        .or_else(|| logins.iter().position(|l| valid(&l)))
+        .or(if logins.is_empty() { None } else { Some(0) })
+}
+
+/// Claude Code's signed-in account (UUID, email), from `~/.claude.json`.
+fn cli_account() -> Option<(String, Option<String>)> {
+    let home = std::env::var("HOME").ok()?;
+    let dir = std::env::var("CLAUDE_CONFIG_DIR").unwrap_or(home.clone());
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(format!("{dir}/.claude.json")).ok()?).ok()?;
+    let a = &v["oauthAccount"];
+    Some((a["accountUuid"].as_str()?.to_string(), a["emailAddress"].as_str().map(String::from)))
+}
+
+/// Emails of accounts only the desktop app knows, looked up once per account.
+static EMAILS: Mutex<Vec<(String, Option<String>)>> = Mutex::new(Vec::new());
+
+fn account_email(id: &str, creds: &Creds) -> Option<String> {
+    if let Some((_, e)) = EMAILS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(i, _)| i == id) {
+        return e.clone();
+    }
+    if creds.expired() {
+        return None;
+    }
+    let email = fetch_profile_email(&creds.token);
+    EMAILS.lock().unwrap_or_else(|e| e.into_inner()).push((id.to_string(), email.clone()));
+    email
+}
+
+/// Both Claude Code stores can hold a token (the Keychain item, or the file when the Keychain
+/// isn't used); after a re-login only one of them is current, so take the longest-lived.
+fn read_cli_creds(service: &str) -> Option<Creds> {
+    let home = std::env::var("HOME").ok();
+    let file = home.and_then(|h| std::fs::read_to_string(format!("{h}/.claude/.credentials.json")).ok());
+    [keychain_password(service), file]
+        .into_iter()
+        .flatten()
+        .filter_map(|raw| {
+            let v: Value = serde_json::from_str(&raw).ok()?;
+            let oauth = &v["claudeAiOauth"];
+            Some(Creds {
+                token: oauth["accessToken"].as_str()?.to_string(),
+                expires_at: oauth["expiresAt"].as_i64().map(|ms| ms / 1000),
+            })
+        })
+        .max_by_key(|c| c.expires_at.unwrap_or(i64::MAX))
+}
+
+struct DesktopLogins {
+    /// Best usage-capable token per account UUID.
+    tokens: Vec<(String, Creds)>,
+    /// `lastKnownAccountUuid`: the account the app is signed in to now.
+    active: Option<String>,
+    read_at: i64,
+}
+
+/// Decrypting the desktop tokens runs `security`; reuse the result for a while.
+static DESKTOP_CACHE: Mutex<Option<DesktopLogins>> = Mutex::new(None);
 /// After a failed desktop read (no app, no item, prompt denied) don't ask again for a while.
 static DESKTOP_RETRY_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 const DESKTOP_RETRY_SECS: i64 = 600;
 
-fn read_cli_creds(service: &str) -> Option<Creds> {
-    let out = keychain_password(service)
-        .or_else(|| {
-            let home = std::env::var("HOME").ok()?;
-            std::fs::read_to_string(format!("{home}/.claude/.credentials.json")).ok()
-        })?;
-    let v: Value = serde_json::from_str(&out).ok()?;
-    let oauth = &v["claudeAiOauth"];
-    Some(Creds {
-        token: oauth["accessToken"].as_str()?.to_string(),
-        expires_at: oauth["expiresAt"].as_i64().map(|ms| ms / 1000),
+fn desktop_logins() -> Option<DesktopLogins> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut cache = DESKTOP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = cache.as_ref().is_some_and(|c| {
+        now() - c.read_at < DESKTOP_RETRY_SECS && c.tokens.iter().all(|(_, t)| !t.expired())
+    });
+    if !fresh {
+        if now() < DESKTOP_RETRY_AT.load(Relaxed) {
+            return None;
+        }
+        *cache = read_desktop_logins();
+        if cache.is_none() {
+            DESKTOP_RETRY_AT.store(now() + DESKTOP_RETRY_SECS, Relaxed);
+        }
+    }
+    let c = cache.as_ref()?;
+    Some(DesktopLogins {
+        tokens: c.tokens.clone(),
+        active: c.active.clone(),
+        read_at: c.read_at,
     })
 }
 
 /// The Claude desktop app keeps OAuth tokens in `config.json`, encrypted with Electron's
 /// safeStorage (AES-128-CBC; key = PBKDF2-SHA1 of the "Claude Safe Storage" keychain
-/// password). Read-only: the app refreshes its own tokens.
-fn read_desktop_creds() -> Option<Creds> {
-    use std::sync::atomic::Ordering::Relaxed;
-    if now() < DESKTOP_RETRY_AT.load(Relaxed) {
-        return None;
-    }
-    let found = read_desktop_creds_once();
-    if found.is_none() {
-        DESKTOP_RETRY_AT.store(now() + DESKTOP_RETRY_SECS, Relaxed);
-    }
-    found
-}
-
-fn read_desktop_creds_once() -> Option<Creds> {
+/// password). Read-only: the app refreshes its own tokens. It can hold several accounts.
+fn read_desktop_logins() -> Option<DesktopLogins> {
     use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 
     let home = std::env::var("HOME").ok()?;
@@ -608,7 +794,7 @@ fn read_desktop_creds_once() -> Option<Creds> {
     let mut key = [0u8; 16];
     pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password.as_bytes(), b"saltysalt", 1003, &mut key);
 
-    let mut best: Option<Creds> = None;
+    let mut tokens: Vec<(String, Creds)> = Vec::new();
     for field in ["oauth:tokenCacheV2", "oauth:tokenCache"] {
         let Some(raw) = config[field].as_str().and_then(base64_decode) else { continue };
         let Some(body) = raw.strip_prefix(b"v10") else { continue };
@@ -617,20 +803,41 @@ fn read_desktop_creds_once() -> Option<Creds> {
         let Ok(plain) = dec.decrypt_padded_mut::<Pkcs7>(&mut buf) else { continue };
         let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(plain) else { continue };
         for (name, entry) in entries {
+            let Some((id, scopes)) = desktop_key(&name) else { continue };
             // Usage needs the `user:profile` scope; `user:office` etc. tokens can't read it.
-            // Key shape: `acct:<account>|<client>:<org>:https://api.anthropic.com:<scopes>`.
-            let scopes = name.rsplit_once("https://api.anthropic.com:").map_or("", |(_, s)| s);
             if !scopes.split_whitespace().any(|s| s == "user:profile") {
                 continue;
             }
             let (Some(token), Some(ms)) = (entry["token"].as_str(), entry["expiresAt"].as_i64()) else { continue };
             let c = Creds { token: token.to_string(), expires_at: Some(ms / 1000) };
-            if best.as_ref().is_none_or(|b| b.expires_at < c.expires_at) {
-                best = Some(c);
+            match tokens.iter_mut().find(|(i, _)| i == id) {
+                Some((_, best)) if best.expires_at >= c.expires_at => {}
+                Some((_, best)) => *best = c,
+                None => tokens.push((id.to_string(), c)),
             }
         }
     }
-    best
+    if tokens.is_empty() {
+        return None;
+    }
+    Some(DesktopLogins { tokens, active: config["lastKnownAccountUuid"].as_str().map(String::from), read_at: now() })
+}
+
+/// `acct:<account>|<client>:<org>:https://api.anthropic.com:<scopes>` → (account, scopes).
+fn desktop_key(name: &str) -> Option<(&str, &str)> {
+    let (_, scopes) = name.rsplit_once("https://api.anthropic.com:")?;
+    let id = name.strip_prefix("acct:")?.split('|').next()?;
+    Some((id, scopes))
+}
+
+/// Antigravity's signed-in Google account.
+fn antigravity_email() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let read = |p: &str| -> Option<Value> { serde_json::from_str(&std::fs::read_to_string(format!("{home}/{p}")).ok()?).ok() };
+    read(".gemini/antigravity-cli/antigravity-oauth-token")
+        .and_then(|v| v["id_token_email"].as_str().map(String::from))
+        .or_else(|| read(".gemini/google_accounts.json").and_then(|v| v["active"].as_str().map(String::from)))
+        .filter(|e| !e.is_empty())
 }
 
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
@@ -871,14 +1078,22 @@ fn fetch_antigravity() -> Result<Snapshot, FetchError> {
     })
 }
 
-fn fetch(token: &str) -> Result<Snapshot, FetchError> {
+/// Account email for a token, from the OAuth profile endpoint (no model call).
+fn fetch_profile_email(token: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(&api_get(PROFILE_URL, token).ok()?).ok()?;
+    let a = &v["account"];
+    a["email"].as_str().or(a["email_address"].as_str()).map(String::from)
+}
+
+/// GET an Anthropic OAuth endpoint; returns the body of a 200.
+fn api_get(url: &str, token: &str) -> Result<String, FetchError> {
     // The token goes into a header block on stdin: refuse anything that could add lines.
     if !token.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~+/=".contains(&b)) {
         return Err(FetchError::Unauthorized);
     }
     // Headers go through stdin so the token never appears in `ps`.
     let mut child = Command::new("/usr/bin/curl")
-        .args(["-q", "-sS", "--proto", "=https", "-m", "10", "-A", "notchi-usage/0.1", "-H", "@-", "-w", "\n%{http_code} %header{retry-after}", USAGE_URL])
+        .args(["-q", "-sS", "--proto", "=https", "-m", "10", "-A", "notchi-usage/0.1", "-H", "@-", "-w", "\n%{http_code} %header{retry-after}", url])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -897,14 +1112,18 @@ fn fetch(token: &str) -> Result<Snapshot, FetchError> {
     let code = status.next().unwrap_or("");
     let retry_after = status.next().and_then(|v| v.parse::<u64>().ok());
     match code {
-        "200" => {}
-        "401" | "403" => return Err(FetchError::Unauthorized),
-        "429" => return Err(FetchError::RateLimited(retry_after)),
-        "000" | "" => return Err(FetchError::Offline),
-        c if c.starts_with('5') => return Err(FetchError::Other("Anthropic API is having trouble")),
-        _ => return Err(FetchError::Other("Unexpected response")),
+        "200" => Ok(body.to_string()),
+        "401" | "403" => Err(FetchError::Unauthorized),
+        "429" => Err(FetchError::RateLimited(retry_after)),
+        "000" | "" => Err(FetchError::Offline),
+        c if c.starts_with('5') => Err(FetchError::Other("Anthropic API is having trouble")),
+        _ => Err(FetchError::Other("Unexpected response")),
     }
-    let v: Value = serde_json::from_str(body).map_err(|_| FetchError::Other("Unexpected response"))?;
+}
+
+fn fetch(token: &str) -> Result<Snapshot, FetchError> {
+    let body = api_get(USAGE_URL, token)?;
+    let v: Value = serde_json::from_str(&body).map_err(|_| FetchError::Other("Unexpected response"))?;
     let limit = |k: &str| -> Option<Limit> {
         let o = v.get(k)?;
         Some(Limit {
@@ -981,15 +1200,42 @@ mod tests {
         assert_eq!(String::from_utf8(decoded).unwrap(), text);
     }
 
-    /// Exercises the Claude desktop app path end to end on a machine signed in to it.
     #[test]
-    #[ignore = "needs a local Claude desktop login and network"]
-    fn desktop_login_fetch() {
-        let creds = read_desktop_creds_once().expect("no usable desktop token");
-        eprintln!("desktop token: expired={} ttl={:?}s", creds.expired(), creds.expires_at.map(|t| t - now()));
-        let snap = fetch(&creds.token).unwrap_or_else(|e| panic!("usage fetch failed: {}", e.message()));
-        eprintln!("session used={:?} weekly used={:?}", snap.five_hour.map(|l| l.used), snap.seven_day.map(|l| l.used));
-        assert!(snap.five_hour.is_some());
+    fn desktop_key_parsing() {
+        let k = "acct:6e5c|client1:org9:https://api.anthropic.com:user:inference user:profile";
+        assert_eq!(desktop_key(k), Some(("6e5c", "user:inference user:profile")));
+        assert_eq!(desktop_key("garbage"), None);
+    }
+
+    fn login(id: &str, cli: bool, desktop_active: bool, expires_in: i64) -> Login {
+        Login {
+            account: Account { id: id.into(), email: Some(format!("{id}@x.com")), cli, desktop: !cli, desktop_active },
+            creds: Creds { token: "t".into(), expires_at: Some(now() + expires_in) },
+        }
+    }
+
+    #[test]
+    fn picks_pinned_then_cli_then_desktop_current() {
+        let logins = vec![login("a", true, false, 3600), login("b", false, false, 3600), login("c", false, true, 3600)];
+        assert_eq!(pick_login(&logins, ""), Some(0));
+        assert_eq!(pick_login(&logins, "B@X.com"), Some(1));
+        assert_eq!(pick_login(&logins, "c"), Some(2));
+        // A pinned account that signed out falls back to automatic.
+        assert_eq!(pick_login(&logins, "gone@x.com"), Some(0));
+        // Claude Code's token expired: the desktop app's current account, not just any.
+        let logins = vec![login("a", true, false, -10), login("b", false, false, 3600), login("c", false, true, 3600)];
+        assert_eq!(pick_login(&logins, ""), Some(2));
+        assert_eq!(pick_login(&[], ""), None);
+    }
+
+    /// Lists every Claude login on a machine signed in to Claude Code and/or the desktop app.
+    #[test]
+    #[ignore = "needs local Claude logins and network"]
+    fn list_local_accounts() {
+        for l in claude_logins("Claude Code-credentials") {
+            eprintln!("{} [{}] expired={}", l.account.label(), l.account.sources(), l.creds.expired());
+        }
+        eprintln!("antigravity: {:?}", antigravity_email());
     }
 
     #[test]

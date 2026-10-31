@@ -34,7 +34,7 @@ use objc2_service_management::{SMAppService, SMAppServiceStatus};
 
 use theme::{Color, Type, EXPANDED_W, FLARE, PAD};
 use usage::{
-    history_for, save_provider_config, snapshot_for, Limit, Provider, Sample, Snapshot,
+    history_for, save_claude_account, save_provider_config, snapshot_for, Limit, Provider, Sample, Snapshot,
 };
 
 const HOVER_IN_DELAY: f64 = 0.12;
@@ -114,6 +114,8 @@ struct Ivars {
     shape: OnceCell<Retained<CAShapeLayer>>,
     /// Redraw timer while characters tremble or teeter on the weekly bar.
     teeter: RefCell<Option<Retained<NSTimer>>>,
+    /// Account ids behind the open menu's account items (tag = index + 1; 0 = automatic).
+    menu_accounts: RefCell<Vec<String>>,
 }
 
 // A panel that can never take keyboard focus or become main — the notch must not
@@ -210,6 +212,16 @@ define_class!(
                 return; // At least one provider must remain selected
             }
             self.set_provider_visibility(Provider::Antigravity, !cur);
+        }
+
+        #[unsafe(method(selectClaudeAccount:))]
+        fn select_claude_account(&self, sender: Option<&NSMenuItem>) {
+            let Some(tag) = sender.map(|s| s.tag()) else { return };
+            let ids = self.ivars().menu_accounts.borrow();
+            let id = usize::try_from(tag - 1).ok().and_then(|i| ids.get(i));
+            save_claude_account(id.map(String::as_str));
+            drop(ids);
+            self.refresh();
         }
 
         #[unsafe(method(openClaudePage:))]
@@ -385,6 +397,9 @@ impl NotchView {
         }
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
+        if self.add_account_items(&menu) {
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
+        }
         // Launch at Login (only meaningful for the installed .app).
         unsafe {
             let login = NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -400,6 +415,64 @@ impl NotchView {
         }
         item(ns_string!("Quit Notchi Usage"), sel!(terminate:), None);
         menu
+    }
+
+    /// Signed-in accounts: an account picker when Claude has several, else a plain label.
+    /// Returns whether anything was added.
+    fn add_account_items(&self, menu: &NSMenu) -> bool {
+        let mtm = self.mtm();
+        let iv = self.ivars();
+        let label = |title: &str| {
+            let it = NSMenuItem::new(mtm);
+            it.setTitle(&NSString::from_str(title));
+            it.setEnabled(false);
+            menu.addItem(&it);
+        };
+        let mut added = false;
+        if iv.show_claude.get() {
+            let accounts = usage::claude_accounts();
+            let current = usage::current_account(Provider::Claude);
+            match accounts.as_slice() {
+                [] => {}
+                [only] => label(&format!("Claude: {} ({})", only.label(), only.sources())),
+                _ => {
+                    let pinned = usage::chosen_claude_account();
+                    let title = format!("Claude Account: {}", current.as_deref().unwrap_or("—"));
+                    let parent = NSMenuItem::new(mtm);
+                    parent.setTitle(&NSString::from_str(&title));
+                    let sub = NSMenu::new(mtm);
+                    let choice = |title: &str, tag: isize, on: bool| unsafe {
+                        let it = NSMenuItem::initWithTitle_action_keyEquivalent(
+                            NSMenuItem::alloc(mtm),
+                            &NSString::from_str(title),
+                            Some(sel!(selectClaudeAccount:)),
+                            ns_string!(""),
+                        );
+                        it.setTarget(Some(self));
+                        it.setTag(tag);
+                        it.setState(if on { NSControlStateValueOn } else { NSControlStateValueOff });
+                        sub.addItem(&it);
+                    };
+                    choice("Automatic (Claude Code's login)", 0, pinned.is_none());
+                    sub.addItem(&NSMenuItem::separatorItem(mtm));
+                    for (i, a) in accounts.iter().enumerate() {
+                        let on = pinned.as_deref().is_some_and(|w| a.id.eq_ignore_ascii_case(w) || a.email.as_deref().is_some_and(|e| e.eq_ignore_ascii_case(w)));
+                        choice(&format!("{} — {}", a.label(), a.sources()), i as isize + 1, on);
+                    }
+                    parent.setSubmenu(Some(&sub));
+                    menu.addItem(&parent);
+                }
+            }
+            *iv.menu_accounts.borrow_mut() = accounts.into_iter().map(|a| a.id).collect();
+            added |= !iv.menu_accounts.borrow().is_empty();
+        }
+        if iv.show_antigravity.get() {
+            if let Some(email) = usage::current_account(Provider::Antigravity) {
+                label(&format!("Antigravity: {email}"));
+                added = true;
+            }
+        }
+        added
     }
 
     fn refresh(&self) {
@@ -671,7 +744,8 @@ impl NotchView {
                             format!("{name} {} left{reset}", pct(l.left()))
                         })
                         .collect();
-                    format!("{}: {}", p.display_name(), rows_str.join("; "))
+                    let who = usage::current_account(p).map_or(String::new(), |a| format!(" ({a})"));
+                    format!("{}{who}: {}", p.display_name(), rows_str.join("; "))
                 }
             };
             parts.push(label);
@@ -833,13 +907,20 @@ impl NotchView {
             let hx = left + 48.0;
             let title = format!("{} · {}", p.display_name(), mood.title());
             text(&title, hx, section_top + 4.0, &theme::TITLE, theme::TEXT_PRIMARY, Align::Left);
+            let account = usage::current_account(p);
             let status = match snap.as_ref() {
                 _ if iv.refreshing.get() => "Refreshing…".to_string(),
                 None => "Loading…".to_string(),
                 Some(s) => match (s.error, s.fetched_at) {
                     (Some(e), 0) => e.to_string(),
                     (Some(e), t) => format!("{e} · data {}", ago(usage::now() - t)),
-                    (None, t) => format!("Updated {} · click to refresh", ago(usage::now() - t)),
+                    (None, t) => match &account {
+                        // Several accounts may be signed in: say whose numbers these are.
+                        Some(a) if hx + measure(&format!("Updated {} · {a}", ago(usage::now() - t)), &theme::CAPTION) <= right => {
+                            format!("Updated {} · {a}", ago(usage::now() - t))
+                        }
+                        _ => format!("Updated {} · click to refresh", ago(usage::now() - t)),
+                    },
                 },
             };
             text(&status, hx, section_top + 23.0, &theme::CAPTION, theme::TEXT_SECONDARY, Align::Left);

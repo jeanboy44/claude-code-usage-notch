@@ -16,7 +16,7 @@ A tiny, cute usage meter for Claude Code and Google Antigravity that lives in yo
 - **Hover** — expands to show every limit (Session, Weekly, plus Opus/Sonnet weekly for Claude; Session 5-Hour and Weekly for Antigravity) with remaining-bars, percentage left, and time until reset.
 - **Menu toggling** — right-click (or ctrl-click) context menu lets you toggle Claude Code and Google Antigravity visibility at runtime with persistent settings.
 - **Session graph** — a hairline graph of session % left across the current 5-hour window, with an even-pace guide (built from Notchi's own polls, so it fills in while it runs).
-- **Click** to refresh now. **Right-click** for Refresh Now / Open Usage Page / Provider Toggles / Launch at Login / Quit.
+- **Click** to refresh now. **Right-click** for Refresh Now / Open Usage Page / Provider Toggles / signed-in accounts (and a Claude account picker when several are signed in) / Launch at Login / Quit.
 - Character mood follows whichever limit is tightest: happy → busy → sweating → dizzy. Characters blink and emote dynamically.
 
 ## Data & token cost
@@ -60,9 +60,10 @@ refresh_secs = 120                           # poll interval, min 30; backs off 
 keychain_service = Claude Code-credentials   # point at another account/profile's Keychain item
 show_claude = true                           # toggle Claude Code provider visibility
 show_antigravity = true                      # toggle Google Antigravity provider visibility
+claude_account = auto                        # or an account email/UUID to pin (also settable from the right-click menu)
 ```
 
-Multiple accounts: by default the account behind the default Keychain item is shown. Recent Claude Code versions store a separate item per `CLAUDE_CONFIG_DIR` (named like `Claude Code-credentials-<hash>`); find yours with `security dump-keychain | grep "Claude Code-credentials"` and set `keychain_service` to show that profile instead.
+Multiple accounts: the expanded panel shows which account each provider's numbers belong to. When Claude Code and the Claude desktop app are signed in to different accounts (or the app holds several), right-click → **Claude Account** to pick one; **Automatic** follows Claude Code's login, then the desktop app's current account. By default Claude Code's login comes from the default Keychain item (or `~/.claude/.credentials.json`, whichever is newer). Recent Claude Code versions store a separate item per `CLAUDE_CONFIG_DIR` (named like `Claude Code-credentials-<hash>`); find yours with `security dump-keychain | grep "Claude Code-credentials"` and set `keychain_service` to show that profile instead.
 
 ## Behaviour notes
 
